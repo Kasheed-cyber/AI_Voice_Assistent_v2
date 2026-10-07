@@ -42,6 +42,7 @@ const chunkCounters = new Map();
 // могла быть распознана как та же задача, даже если текст немного отличается.
 const sentTaskKeys = new Map();
 const sentEventKeys = new Map();
+const callConfigs = new Map();
 
 // === PYTHON SERVICE ===
 let pyService = null;
@@ -172,7 +173,7 @@ const SYSTEM_PROMPT = `Ты — ассистент, который проток�
 Не выдумывай факты. Если связь с договором неизвестна, используй null.
 Отвечай ТОЛЬКО валидным JSON.`
 
-async function extractProtocol(text) {
+async function extractProtocol(text, config = {}) {
   if (!text.trim()) return null;
   try {
     const response = await fetch('http://localhost:11434/api/chat', {
@@ -181,7 +182,7 @@ async function extractProtocol(text) {
       body: JSON.stringify({
         model: 'qwen3:8b',
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'system', content: SYSTEM_PROMPT + `\n\nПользовательские настройки протокола:\n- Приоритет по умолчанию: ${config.defaultPriority || 'medium'}\n- Фразы-триггеры для фиксации задач: ${config.triggerPhrases || 'любое явное обязательство выполнить действие'}\n- Шаблон задачи: ${config.taskTemplate || 'краткое действие + срок'}\nЕсли пользовательские настройки не противоречат фактам разговора, учитывай их при формировании tasks.` },
           { role: 'user', content: `Транскрипт:\n\n${text}` }
         ],
         stream: false,
@@ -225,15 +226,17 @@ function inferDeadlineFromTranscript(transcript, taskText) {
   return null;
 }
 
-function repairProtocolData(protocol, transcript) {
+function repairProtocolData(protocol, transcript, config = {}) {
   const data = parseProtocol(protocol);
   if (!data) return null;
 
+  const defaultPriority = ['low', 'medium', 'high'].includes(config.defaultPriority) ? config.defaultPriority : 'medium';
   const allContracts = data.contracts || [];
   const allTasks = [];
   for (const contract of allContracts) {
     contract.tasks = contract.tasks || [];
     for (const task of contract.tasks) {
+      if (!['low', 'medium', 'high'].includes(task.priority)) task.priority = defaultPriority;
       if (!task.deadline) {
         const inferred = inferDeadlineFromTranscript(transcript, task.task);
         if (inferred) task.deadline = inferred;
@@ -244,6 +247,7 @@ function repairProtocolData(protocol, transcript) {
 
   data.tasks = data.tasks || [];
   for (const task of data.tasks) {
+    if (!['low', 'medium', 'high'].includes(task.priority)) task.priority = defaultPriority;
     if (!task.deadline) {
       const inferred = inferDeadlineFromTranscript(transcript, task.task);
       if (inferred) task.deadline = inferred;
@@ -264,7 +268,7 @@ function repairProtocolData(protocol, transcript) {
       task: /^достав/i.test(title) ? title : `Доставить товар: ${title}`,
       deadline: deadline || null,
       status: 'pending',
-      priority: 'medium',
+      priority: defaultPriority,
       contract_id: null,
       contract_name: null
     };
@@ -326,6 +330,27 @@ function taskLooksSame(a, b) {
   // («Пришлите новые исходники сегодня» -> «Пришлите новые исходники»),
   // считаем это одной задачей.
   return (common / minSize >= 0.75) || (common / union >= 0.55);
+}
+
+function normalizeEventText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[^а-яa-z0-9\s:]/gi, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(w => !['сегодня','завтра','утром','вечером','до','к','в','на'].includes(w));
+}
+
+function eventLooksSame(a, b) {
+  const aa = normalizeEventText(a.title);
+  const bb = normalizeEventText(b.title);
+  if (!aa || !bb || a.time !== b.time) return false;
+  const setA = new Set(aa.split(' '));
+  const setB = new Set(bb.split(' '));
+  let common = 0;
+  for (const word of setA) if (setB.has(word)) common++;
+  return common / Math.min(setA.size, setB.size) >= 0.65;
 }
 
 function taskKey(callId, task) {
@@ -401,14 +426,15 @@ async function sendEventsToCalendar(protocol, callId) {
       }
     }
     for (const task of contract.tasks || []) {
-      if (task.deadline) {
+      if (task.deadline && /\d{1,2}(?::\d{2})?|\bк\b|\bв\b/i.test(String(task.deadline))) {
         candidates.push({ title: task.task || 'Задача по договорённости', time: task.deadline, contract });
       }
     }
   }
 
   for (const task of data.tasks || []) {
-    if (task.deadline && !candidates.some(x => x.title === task.task && x.time === task.deadline)) {
+    if (task.deadline && /\d{1,2}(?::\d{2})?|\bк\b|\bв\b/i.test(String(task.deadline)) &&
+        !candidates.some(x => eventLooksSame(x, { title: task.task, time: task.deadline }))) {
       candidates.push({ title: task.task || 'Задача по договорённости', time: task.deadline, contract: {} });
     }
   }
@@ -420,9 +446,14 @@ async function sendEventsToCalendar(protocol, callId) {
     }
   }
 
+  const sentEvents = [...sent].map(key => {
+    try { const [storedCall, contractId, title, time] = JSON.parse(key); return { callId: storedCall, contractId, title, time }; } catch (_) { return null; }
+  }).filter(Boolean);
+
   for (const { title, time, contract } of candidates) {
-    const eventKey = JSON.stringify([callId, contract.contract_id || contract.contract_name || '', title, time]);
-    if (sent.has(eventKey)) continue;
+    const contractId = contract.contract_id || contract.contract_name || '';
+    const eventKey = JSON.stringify([callId, contractId, title, time]);
+    if (sent.has(eventKey) || sentEvents.some(x => x.callId === callId && x.contractId === contractId && eventLooksSame(x, { title, time }))) continue;
 
     try {
       const response = await fetch('http://localhost:8000/integrations/calendar/event', {
@@ -437,7 +468,10 @@ async function sendEventsToCalendar(protocol, callId) {
         })
       });
       const result = await response.json();
-      if (response.ok) sent.add(eventKey);
+      if (response.ok) {
+        sent.add(eventKey);
+        sentEvents.push({ callId, contractId, title, time });
+      }
       console.log(`[Calendar] Событие (${contract.contract_id || 'без договора'}): ${result.ics_file}`);
     } catch (e) {
       console.error('[Calendar] Ошибка:', e.message);
@@ -461,9 +495,25 @@ function setupAudioHandler(wss) {
     chunkCounters.set(callId, 0);
     sentTaskKeys.set(callId, []);
     sentEventKeys.set(callId, new Set());
+    callConfigs.set(callId, { defaultPriority: 'medium', triggerPhrases: '', taskTemplate: '' });
 
     ws.on('message', async (data) => {
-      if (!Buffer.isBuffer(data)) return;
+      if (!Buffer.isBuffer(data)) {
+        try {
+          const message = JSON.parse(data.toString());
+          if (message.type === 'config') {
+            callConfigs.set(callId, {
+              defaultPriority: ['low', 'medium', 'high'].includes(message.defaultPriority) ? message.defaultPriority : 'medium',
+              triggerPhrases: String(message.triggerPhrases || '').slice(0, 500),
+              taskTemplate: String(message.taskTemplate || '').slice(0, 200)
+            });
+            console.log(`[Config] ${callId}: настройки протокола обновлены`);
+          }
+        } catch (e) {
+          console.error('[Audio] Ошибка config:', e.message);
+        }
+        return;
+      }
 
       let buffer = buffers.get(callId) || Buffer.alloc(0);
       buffer = Buffer.concat([buffer, data]);
@@ -498,8 +548,9 @@ function setupAudioHandler(wss) {
             chunkCounters.set(callId, cnt);
 
             if (cnt % PROTOCOL_INTERVAL_CHUNKS === 0) {
-              let protocol = await extractProtocol(updated);
-              protocol = repairProtocolData(protocol, updated) || protocol;
+              const config = callConfigs.get(callId) || {};
+              let protocol = await extractProtocol(updated, config);
+              protocol = repairProtocolData(protocol, updated, config) || protocol;
               if (protocol && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                   type: 'protocol',
@@ -525,8 +576,9 @@ function setupAudioHandler(wss) {
       console.log(`[Audio] Клиент отключён: ${callId}`);
 
       const transcript = transcripts.get(callId) || '';
-      let protocol = await extractProtocol(transcript);
-      protocol = repairProtocolData(protocol, transcript) || protocol;
+      const config = callConfigs.get(callId) || {};
+      let protocol = await extractProtocol(transcript, config);
+      protocol = repairProtocolData(protocol, transcript, config) || protocol;
       if (protocol) {
         const outPath = path.join(OUTPUT_DIR, `${callId}_protocol.enc.json`);
         fs.writeFileSync(outPath, encryptAtRest(protocol), 'utf-8');
@@ -541,6 +593,7 @@ function setupAudioHandler(wss) {
       chunkCounters.delete(callId);
       sentTaskKeys.delete(callId);
       sentEventKeys.delete(callId);
+      callConfigs.delete(callId);
     });
 
     ws.on('error', (err) => {
@@ -551,4 +604,4 @@ function setupAudioHandler(wss) {
   console.log('[Audio] WebSocket-сервер для аудио готов');
 }
 
-module.exports = { setupAudioHandler, _test: { normalizeTaskText, taskLooksSame, taskKey, inferDeadlineFromTranscript, repairProtocolData } };
+module.exports = { setupAudioHandler, _test: { normalizeTaskText, taskLooksSame, taskKey, inferDeadlineFromTranscript, repairProtocolData, eventLooksSame } };

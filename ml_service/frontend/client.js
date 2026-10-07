@@ -18,6 +18,12 @@ let myId = null;
 let mode = null;
 let audioProcessCalls = 0;
 let audioBytesSent = 0;
+let mixedAudioStream = null;
+let micGainNode = null;
+let mixDestination = null;
+let complianceAudioBuffer = null;
+let complianceAnnouncementStarted = false;
+const COMPLIANCE_AUDIO_URL = 'compliance_warning.wav';
 
 // === ЭЛЕМЕНТЫ UI ===
 const statusEl = document.getElementById('status');
@@ -25,8 +31,7 @@ const logEl = document.getElementById('log');
 const callerBtn = document.getElementById('callerBtn');
 const listenerBtn = document.getElementById('listenerBtn');
 const stopBtn = document.getElementById('stopBtn');
-const localVideo = document.getElementById('localVideo');
-const remoteVideo = document.getElementById('remoteVideo');
+const remoteAudio = document.getElementById('remoteAudio');
 
 // === ВСПОМОГАТЕЛЬНЫЕ ===
 function log(msg) {
@@ -122,11 +127,77 @@ function isAiServiceEnabled() {
   return document.getElementById('agentToggle')?.checked === true;
 }
 
+const AI_NOTICE_TEXT = 'Внимание! Разговор записывается и обрабатывается искусственным интеллектом для распознавания речи и автоматической фиксации договорённостей.';
+
+async function prepareOutgoingAudio() {
+  audioContext = new AudioContext({ sampleRate: 16000 });
+  const source = audioContext.createMediaStreamSource(localStream);
+  const destination = audioContext.createMediaStreamDestination();
+  mixDestination = destination;
+  micGainNode = audioContext.createGain();
+  micGainNode.gain.value = isAiServiceEnabled() ? 0 : 1;
+  source.connect(micGainNode);
+  micGainNode.connect(destination);
+  mixedAudioStream = destination.stream;
+
+  if (!isAiServiceEnabled()) return;
+
+  try {
+    const response = await fetch(COMPLIANCE_AUDIO_URL, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const buffer = await response.arrayBuffer();
+    complianceAudioBuffer = await audioContext.decodeAudioData(buffer);
+    log('⚖️ Голосовое предупреждение загружено и готово для WebRTC');
+  } catch (err) {
+    log('⚠️ Не удалось загрузить голосовое предупреждение: ' + err.message);
+    micGainNode.gain.value = 1;
+  }
+}
+
+function playComplianceAnnouncement() {
+  if (!isAiServiceEnabled() || complianceAnnouncementStarted || !complianceAudioBuffer || !audioContext || !micGainNode) {
+    if (micGainNode && !isAiServiceEnabled()) micGainNode.gain.value = 1;
+    return;
+  }
+
+  complianceAnnouncementStarted = true;
+  const announcement = audioContext.createBufferSource();
+  const announcementGain = audioContext.createGain();
+  announcementGain.gain.value = 1;
+  announcement.buffer = complianceAudioBuffer;
+  announcement.connect(announcementGain);
+  announcementGain.connect(audioContext.destination);
+
+  // Главное: это же объявление отправляется в MediaStreamDestination,
+  // поэтому его слышит второй участник, а не только браузер звонящего.
+  const outgoingAnnouncement = audioContext.createBufferSource();
+  const outgoingGain = audioContext.createGain();
+  outgoingGain.gain.value = 1;
+  outgoingAnnouncement.buffer = complianceAudioBuffer;
+  outgoingAnnouncement.connect(outgoingGain);
+  outgoingGain.connect(mixDestination);
+
+  const startAt = audioContext.currentTime + 0.15;
+  announcement.start(startAt);
+  outgoingAnnouncement.start(startAt);
+
+  outgoingAnnouncement.onended = () => {
+    if (micGainNode) {
+      micGainNode.gain.setTargetAtTime(1, audioContext.currentTime, 0.02);
+    }
+    log('🔊 Голосовое предупреждение передано второму участнику через WebRTC');
+    showToast('Второй участник услышал уведомление об ИИ-обработке');
+  };
+
+  signalingWs?.send(JSON.stringify({ type: 'ai_notice', callId: myId, text: AI_NOTICE_TEXT }));
+  log('⚖️ Compliance: уведомление отправлено и воспроизводится в звонке');
+}
+
 function showAiProcessingNotice() {
-  const text = 'Внимание: при подключенной услуге этот разговор обрабатывается ИИ для распознавания речи и автоматической фиксации договорённостей.';
-  const confirmed = window.confirm(text + '\n\nПродолжить звонок?');
-  if (confirmed) showToast('Участники уведомлены: разговор обрабатывается ИИ');
-  return confirmed;
+  if (!isAiServiceEnabled()) return true;
+  return window.confirm(
+    AI_NOTICE_TEXT + '\n\nПродолжить звонок? Второй участник автоматически услышит это уведомление.'
+  );
 }
 
 // === СТАРТ ЗВОНКА ===
@@ -146,22 +217,17 @@ async function startCall(selectedMode) {
       localStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false
-        },
-        video: true
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
       });
-      localVideo.srcObject = localStream;
-      log('Микрофон и камера получены (режим: звонящий)');
+      await prepareOutgoingAudio();
+      log('Микрофон получен (режим: звонящий)');
     } else {
-      setStatus('Запрос доступа к камере (без микрофона)...');
-      localStream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: true
-      });
-      localVideo.srcObject = localStream;
-      log('Камера получена (режим: слушатель, без микрофона)');
+      setStatus('Подключение в режиме слушателя...');
+      localStream = new MediaStream();
+      log('Режим слушателя: камера отключена, ожидаем голосовой канал');
     }
 
     connectSignaling();
@@ -190,15 +256,7 @@ function connectSignaling() {
       myId = msg.id;
       log('Мой ID: ' + myId);
 
-      if (mode === 'caller') {
-        if (isAiServiceEnabled()) {
-          const notice = 'Внимание: этот разговор обрабатывается ИИ для распознавания речи и автоматической фиксации договорённостей.';
-          signalingWs.send(JSON.stringify({ type: 'ai_notice', callId: myId, text: notice }));
-          log('⚖️ Уведомление об ИИ-обработке отправлено участникам');
-        }
-        connectAudio();
-      }
-
+      if (mode === 'caller') connectAudio();
       await createPeerConnection();
 
     } else if (msg.type === 'offer') {
@@ -218,13 +276,12 @@ function connectSignaling() {
       }
 
     } else if (msg.type === 'ai_notice') {
-      const notice = msg.text || 'Внимание: этот разговор обрабатывается ИИ.';
+      const notice = msg.text || 'Внимание! Разговор записывается и обрабатывается искусственным интеллектом.';
       log('⚖️ Уведомление: ' + notice);
-      showToast(notice);
+      showToast('ИИ-обработка активна: уведомление прозвучит в звонке');
       setStatus('ИИ-обработка активна', 'connected');
     } else if (msg.type === 'peer-left') {
       log('Второй участник отключился');
-      remoteVideo.srcObject = null;
     }
   };
 
@@ -242,9 +299,11 @@ function connectSignaling() {
 async function createPeerConnection() {
   pc = new RTCPeerConnection(ICE_CONFIG);
 
-  localStream.getTracks().forEach(track => {
-    pc.addTrack(track, localStream);
-  });
+  if (mode === 'caller' && mixedAudioStream) {
+    mixedAudioStream.getTracks().forEach(track => pc.addTrack(track, mixedAudioStream));
+  } else {
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  }
 
   pc.onicecandidate = (event) => {
     if (event.candidate && signalingWs.readyState === WebSocket.OPEN) {
@@ -257,8 +316,9 @@ async function createPeerConnection() {
 
   pc.ontrack = (event) => {
     log('Получен удалённый трек: ' + event.track.kind);
-    if (event.streams[0]) {
-      remoteVideo.srcObject = event.streams[0];
+    if (event.track.kind === 'audio' && event.streams[0] && remoteAudio) {
+      remoteAudio.srcObject = event.streams[0];
+      remoteAudio.play().catch(() => log('ℹ️ Автовоспроизведение аудио ожидает действие пользователя'));
     }
   };
 
@@ -266,6 +326,7 @@ async function createPeerConnection() {
     log('WebRTC состояние: ' + pc.connectionState);
     if (pc.connectionState === 'connected') {
       setStatus('Соединение установлено (' + mode + ')', 'connected');
+      if (mode === 'caller') playComplianceAnnouncement();
     }
   };
 
@@ -278,6 +339,31 @@ async function createPeerConnection() {
   }
 }
 
+function getAgentSettings() {
+  return {
+    defaultPriority: document.getElementById('defaultPriority')?.value || localStorage.getItem('aiDefaultPriority') || 'medium',
+    triggerPhrases: document.getElementById('triggerPhrases')?.value ?? localStorage.getItem('aiTriggerPhrases') ?? 'пришлю, отправлю, согласуем, подтвердим, доставим',
+    taskTemplate: document.getElementById('taskTemplate')?.value ?? localStorage.getItem('aiTaskTemplate') ?? 'Действие + срок'
+  };
+}
+
+function saveAgentSettings() {
+  const settings = getAgentSettings();
+  localStorage.setItem('aiDefaultPriority', settings.defaultPriority);
+  localStorage.setItem('aiTriggerPhrases', settings.triggerPhrases);
+  localStorage.setItem('aiTaskTemplate', settings.taskTemplate);
+  showToast('Настройки ИИ сохранены');
+}
+
+function loadAgentSettings() {
+  const priority = document.getElementById('defaultPriority');
+  const triggers = document.getElementById('triggerPhrases');
+  const template = document.getElementById('taskTemplate');
+  if (priority) priority.value = localStorage.getItem('aiDefaultPriority') || 'medium';
+  if (triggers) triggers.value = localStorage.getItem('aiTriggerPhrases') || 'пришлю, отправлю, согласуем, подтвердим, доставим';
+  if (template) template.value = localStorage.getItem('aiTaskTemplate') || 'Действие + срок';
+}
+
 // === АУДИО-КАНАЛ ===
 function connectAudio() {
   const url = `${AUDIO_URL}?call_id=${myId}`;
@@ -286,6 +372,9 @@ function connectAudio() {
 
   audioWs.onopen = () => {
     log('Audio: подключено к серверу (отправка чанков)');
+    const settings = getAgentSettings();
+    audioWs.send(JSON.stringify({ type: 'config', ...settings }));
+    log('⚙️ Настройки правил переданы ИИ');
   };
 
   audioWs.onmessage = (event) => {
@@ -314,7 +403,7 @@ function connectAudio() {
 
 // === ЗАХВАТ И ОТПРАВКА PCM ===
 function startAudioCapture() {
-  audioContext = new AudioContext({ sampleRate: 16000 });
+  if (!audioContext) audioContext = new AudioContext({ sampleRate: 16000 });
   log(`AudioContext: state=${audioContext.state}, sampleRate=${audioContext.sampleRate}`);
 
   const source = audioContext.createMediaStreamSource(localStream);
@@ -381,8 +470,12 @@ function stopCall() {
   if (audioWs) audioWs.close();
   if (localStream) localStream.getTracks().forEach(t => t.stop());
 
-  localVideo.srcObject = null;
-  remoteVideo.srcObject = null;
+  if (remoteAudio) remoteAudio.srcObject = null;
+  mixedAudioStream = null;
+  micGainNode = null;
+  mixDestination = null;
+  complianceAudioBuffer = null;
+  complianceAnnouncementStarted = false;
 
   setButtonsDisabled(false, false, true);
   setStatus('Звонок завершён');
@@ -419,6 +512,12 @@ function showToast(message) {
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => toast.classList.remove('show'), 2600);
 }
+
+const profileAgentToggle = document.getElementById('profileAgentToggle');
+profileAgentToggle?.addEventListener('change', () => {
+  if (agentToggle) agentToggle.checked = profileAgentToggle.checked;
+  agentToggle?.dispatchEvent(new Event('change'));
+});
 
 agentToggle?.addEventListener('change', () => {
   const enabled = agentToggle.checked;
@@ -487,4 +586,6 @@ document.getElementById('editBtn')?.addEventListener('click', () => {
   showToast('Режим редактирования: здесь оператор сможет изменить задачу или срок');
 });
 
+document.getElementById('saveSettingsBtn')?.addEventListener('click', saveAgentSettings);
+loadAgentSettings();
 log('Клиент готов. Мобильный режим прототипа активен.');

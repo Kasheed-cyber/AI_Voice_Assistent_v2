@@ -48,13 +48,23 @@
             <p>Проведите обычный телефонный разговор. После звонка готовые договорённости появятся в отдельной вкладке.</p>
             <button class="primary-btn" id="demoBtn">▶ Запустить демонстрационный звонок</button>
           </div>
-          <div class="hero-phone">📱<div>Звонок<br><strong>+7 900 123-45-67</strong></div></div>
+          <div class="hero-visual">
+            <div class="voice-orb">✦</div>
+            <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <span>ИИ слушает разговор<br><b>и фиксирует договорённости</b></span>
+          </div>
         </div>
 
         <div class="stats-row">
           <div class="stat-card"><strong id="statCalls">12</strong><span>звонков сегодня</span></div>
           <div class="stat-card"><strong id="statAgreements">8</strong><span>договорённостей</span></div>
           <div class="stat-card"><strong>2</strong><span>активных договора</span></div>
+        </div>
+
+        <div class="compliance-strip">
+          <div class="compliance-icon">✓</div>
+          <div><strong>Конфиденциальность включена</strong><span>Перед разговором второй участник получает голосовое уведомление об ИИ-обработке.</span></div>
+          <span class="secure-badge">AES-256-GCM</span>
         </div>
 
         <div class="section-title"><h3>Последний разговор</h3><button class="text-btn" data-open="agreements">Все договорённости →</button></div>
@@ -124,10 +134,19 @@
       </section>
 
       <section class="tab-page" id="tab-profile">
-        <div class="section-title"><h2>Профиль и настройки</h2></div>
-        <div class="settings-card"><div><strong>ИИ-агент договорённостей</strong><span>Автоматически обрабатывать завершённые звонки</span></div><label class="switch"><input type="checkbox" checked><span></span></label></div>
-        <div class="settings-card"><div><strong>Приоритеты задач</strong><span>Определять приоритет по контексту разговора</span></div><span class="setting-value">Включено</span></div>
-        <div class="settings-card"><div><strong>Конфиденциальность</strong><span>Данные разговора используются для формирования протокола</span></div><span class="setting-value">Настроить →</span></div>
+        <div class="section-title"><div><h2>Профиль и настройки</h2><span class="muted">Правила можно изменить без изменения кода</span></div><span class="ai-chip">Настраиваемый ИИ</span></div>
+        <div class="settings-card"><div><strong>ИИ-агент договорённостей</strong><span>Автоматически обрабатывать звонки и создавать задачи</span></div><label class="switch"><input type="checkbox" id="profileAgentToggle" checked><span></span></label></div>
+        <div class="settings-form">
+          <label><span>Приоритет новых задач</span><select id="defaultPriority"><option value="low">Низкий</option><option value="medium">Средний</option><option value="high">Высокий</option></select></label>
+          <label><span>Фразы-триггеры</span><input id="triggerPhrases" type="text" placeholder="пришлю, отправлю, согласуем..."></label>
+          <label><span>Шаблон задачи</span><input id="taskTemplate" type="text" placeholder="Действие + срок"></label>
+          <button class="primary-btn" id="saveSettingsBtn">Сохранить настройки</button>
+        </div>
+        <div class="security-grid">
+          <div class="security-card"><b>🔒 Шифрование</b><span>Протокол сохраняется в зашифрованном виде.</span></div>
+          <div class="security-card"><b>🧾 Аудит</b><span>Есть endpoint для проверки обращений к данным.</span></div>
+          <div class="security-card"><b>🔗 CRM + календарь</b><span>Задачи и события создаются автоматически.</span></div>
+        </div>
       </section>
 
       <section class="technical-panel">
@@ -135,11 +154,11 @@
           <summary>Технический режим прототипа (WebRTC / ASR / LLM)</summary>
           <div class="tech-actions">
             <button id="callerBtn">Я звонящий (с микрофоном)</button>
-            <button id="listenerBtn">Я слушатель (без микрофона)</button>
+            <button id="listenerBtn">Я участник (без микрофона)</button>
             <button id="stopBtn" disabled>Завершить</button>
           </div>
           <div class="status" id="status">Не подключён</div>
-          <div class="videos"><video id="localVideo" autoplay muted playsinline></video><video id="remoteVideo" autoplay playsinline></video></div>
+          <div class="audio-status"><span class="pulse-dot"></span><div><strong>Голосовой канал WebRTC</strong><small>Видео отключено — для CJM 2 используется только аудио.</small></div><audio id="remoteAudio" autoplay playsinline></audio></div>
           <div id="transcript" class="panel"><h3>📝 Транскрипт</h3></div>
           <div id="protocol" class="panel"><h3>📄 Протокол</h3></div>
           <div class="log"><h3>Лог</h3><pre id="log"></pre></div>
