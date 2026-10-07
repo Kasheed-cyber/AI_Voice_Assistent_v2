@@ -1,71 +1,74 @@
-"""
-Эндпоинты для работы с протоколами разговоров.
-"""
 from fastapi import APIRouter, HTTPException
-from app.schemas import Protocol, TextTranscriptRequest, AudioChunkRequest
+from app.schemas import Protocol, TextTranscriptRequest, AudioChunkRequest, Agreement, CallRecord, Settings
 from app import storage
-from app.llm import extract_protocol
 
-router = APIRouter(prefix="/protocol", tags=["protocol"])
+router = APIRouter(prefix='/protocol', tags=['protocol'])
 
+@router.get('/agreements/all')
+def list_agreements(): return {'agreements': storage.list_agreements()}
 
-@router.post("/start", response_model=Protocol)
+@router.post('/agreement')
+def upsert_agreement(item: Agreement):
+    saved = storage.save_agreement(item); storage.audit('agreement_saved', 'agreement', item.id, item.text)
+    return {'status': 'saved', 'agreement': saved}
+
+@router.delete('/agreement/{item_id}')
+def remove_agreement(item_id: str):
+    if not storage.delete_agreement(item_id): raise HTTPException(404, 'Agreement not found')
+    storage.audit('agreement_deleted', 'agreement', item_id)
+    return {'status': 'deleted', 'id': item_id}
+
+@router.get('/calls/history')
+def call_history():
+    calls = storage.list_calls(); return {'calls': calls, 'total': len(calls)}
+
+@router.post('/calls')
+def save_call(call: CallRecord): return {'status': 'saved', 'call': storage.save_call(call)}
+
+@router.delete('/calls/{call_id}')
+def remove_call(call_id: str):
+    if not storage.delete_call(call_id): raise HTTPException(404, 'Call not found')
+    storage.audit('call_deleted', 'call', call_id); return {'status': 'deleted'}
+
+@router.get('/settings')
+def get_settings(): return storage.get_settings().model_dump(mode='json')
+
+@router.put('/settings')
+def put_settings(settings: Settings):
+    saved = storage.save_settings(settings); storage.audit('settings_updated', 'settings', details='Настройки ИИ изменены'); return saved
+
+@router.get('/audit')
+def audit_log(): return {'events': storage.list_audit()}
+
+@router.get('/', response_model=list[Protocol])
+def list_all_protocols(): return storage.list_protocols()
+
+@router.post('/start', response_model=Protocol)
 def start_call(call_id: str):
-    """Начать новый звонок — создать пустой протокол."""
-    existing = storage.get_protocol(call_id)
-    if existing:
-        return existing
-    return storage.create_protocol(call_id)
+    p = storage.get_protocol(call_id) or storage.create_protocol(call_id); storage.audit('call_started', 'call', call_id); return p
 
+@router.post('/structured', response_model=Protocol)
+def save_structured(payload: dict):
+    call_id = payload.get('call_id')
+    if not call_id: raise HTTPException(400, 'call_id is required')
+    return storage.merge_protocol(call_id, payload)
 
-@router.get("/{call_id}", response_model=Protocol)
-def get_call_protocol(call_id: str):
-    """Получить текущий протокол."""
-    protocol = storage.get_protocol(call_id)
-    if not protocol:
-        raise HTTPException(404, f"Protocol for {call_id} not found")
-    return protocol
-
-
-@router.post("/text", response_model=Protocol)
+@router.post('/text', response_model=Protocol)
 def process_text(request: TextTranscriptRequest):
-    """
-    Обработать готовый текст через LLM (Ollama + Qwen 3 8B).
-    Извлекает договорённости, задачи, участников.
-    """
-    protocol = storage.get_protocol(request.call_id)
-    if not protocol:
-        protocol = storage.create_protocol(request.call_id)
+    from app.llm import extract_protocol
+    extracted = extract_protocol(request.text); return storage.merge_protocol(request.call_id, extracted)
 
-    # Вызов LLM
-    extracted = extract_protocol(request.text)
+@router.post('/chunk')
+def process_audio_chunk(request: AudioChunkRequest): return {'status':'ok','call_id':request.call_id,'chunk_index':request.chunk_index}
 
-    # Обновляем протокол
-    updated = storage.merge_protocol(request.call_id, extracted)
-    return updated or protocol
-
-
-@router.post("/chunk")
-def process_audio_chunk(request: AudioChunkRequest):
-    """
-    Принять аудио-чанк от WebRTC (для real-time).
-    Заглушка: пока ничего не делает.
-    """
-    # TODO: передать чанк в Whisper, накопить транскрипт
-    return {"status": "ok", "call_id": request.call_id, "chunk_index": request.chunk_index}
-
-
-@router.post("/{call_id}/finalize", response_model=Protocol)
+@router.post('/{call_id}/finalize', response_model=Protocol)
 def finalize_call(call_id: str):
-    """Финализировать разговор — сохранить итоговый протокол."""
-    protocol = storage.get_protocol(call_id)
-    if not protocol:
-        raise HTTPException(404, f"Protocol for {call_id} not found")
-    # TODO: финальный вызов LLM на полном транскрипте
-    return protocol
+    p = storage.finalize_protocol(call_id)
+    if not p: raise HTTPException(404, f'Protocol for {call_id} not found')
+    storage.audit('call_finished', 'call', call_id); return p
 
-
-@router.get("/", response_model=list[Protocol])
-def list_all_protocols():
-    """Список всех протоколов (для отладки)."""
-    return storage.list_protocols()
+@router.get('/{call_id}', response_model=Protocol)
+def get_call_protocol(call_id: str):
+    p = storage.get_protocol(call_id)
+    if not p: raise HTTPException(404, f'Protocol for {call_id} not found')
+    return p

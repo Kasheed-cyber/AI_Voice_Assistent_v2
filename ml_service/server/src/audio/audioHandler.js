@@ -2,7 +2,6 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const crypto = require('crypto');
 
 // === НАСТРОЙКИ ===
 const SAMPLE_RATE = 16000;
@@ -16,33 +15,13 @@ const PROJECT_ROOT = path.join(ML_DIR, '..');
 const PYTHON_PATH = path.join(ML_DIR, 'venv', 'Scripts', 'python.exe');
 const SERVICE_SCRIPT = path.join(ML_DIR, 'service.py');
 const OUTPUT_DIR = path.join(PROJECT_ROOT, 'data', 'protocols');
-const DATA_KEY = crypto.createHash('sha256')
-  .update(process.env.AI_DATA_KEY || `dev-${process.pid}-${Date.now()}`)
-  .digest();
-
-function encryptAtRest(text) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', DATA_KEY, iv);
-  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return JSON.stringify({
-    algorithm: 'aes-256-gcm',
-    iv: iv.toString('base64'),
-    tag: tag.toString('base64'),
-    data: encrypted.toString('base64')
-  });
-}
-
 
 // === СОСТОЯНИЕ ===
 const buffers = new Map();
 const transcripts = new Map();
 const chunkCounters = new Map();
-// Уже отправленные задачи/события. Храним сами задачи, чтобы финальная LLM-формулировка
-// могла быть распознана как та же задача, даже если текст немного отличается.
 const sentTaskKeys = new Map();
 const sentEventKeys = new Map();
-const callConfigs = new Map();
 
 // === PYTHON SERVICE ===
 let pyService = null;
@@ -145,35 +124,27 @@ function pcmToWavBuffer(pcmBuffer) {
 
 // === LLM ===
 const SYSTEM_PROMPT = `Ты — ассистент, который протоколирует деловые телефонные разговоры.
-Извлеки все договорённости и задачи. В одном звонке может обсуждаться несколько договоров/сделок.
-НЕ смешивай их: группируй данные по contracts.
+Извлеки:
+1. Участников ("Абонент", "Собеседник", если имена не названы)
+2. Договорённости (что решили)
+3. Задачи (кто, что, к какому сроку)
+4. Ключевые темы
+5. Если в разговоре обсуждается несколько договоров или сделок, ОБЯЗАТЕЛЬНО раздели их. Не смешивай задачи разных договоров.
 
-Формат строго JSON:
+Формат ответа — строго JSON:
 {
-  "topic": "общая тема",
-  "participants": [{"role": "клиент/менеджер", "name": "имя или null"}],
-  "contracts": [
-    {
-      "contract_id": "номер договора или null",
-      "contract_name": "название сделки или null",
-      "agreements": ["договорённость"],
-      "facts": ["сумма/цена/количество/условие оплаты"],
-      "tasks": [{"owner":"кто","task":"что","deadline":"когда или null","status":"pending","priority":"medium"}]
-    }
-  ],
-  "agreements": ["все договорённости"],
-  "facts": ["все суммы, цены, количества и условия оплаты"],
-  "tasks": [{"owner":"кто","task":"что","deadline":"когда или null","status":"pending","priority":"medium","contract_id":"номер или null"}],
-  "key_points": ["ключевая мысль"]
+  "topic": "тема",
+  "participants": ["роль1", "роль2"],
+  "contracts": [{"contract_id":"15","contract_name":"Договор №15","agreements":["договорённость"],"tasks":[{"owner":"кто","task":"что","deadline":"когда","priority":"medium"}]}],
+  "agreements": ["договорённость 1"],
+  "tasks": [{"owner": "кто", "task": "что", "deadline": "когда"}],
+  "key_points": ["мысль 1"]
 }
 
-Критически важно: любое конкретное обязательство стороны выполнить действие должно быть в tasks, даже если оно также указано в agreements/facts.
-Например: «доставку планируем на пятницу» -> task «Доставить 50 кг зерна», deadline «пятница»; «счет скину вам на почту» -> task «Отправить счет на почту»; «оплачу счет завтра утром» -> task «Оплатить счет», deadline «завтра утром».
-Не ставь deadline=null, если срок явно произнесён в транскрипте.
-Не выдумывай факты. Если связь с договором неизвестна, используй null.
-Отвечай ТОЛЬКО валидным JSON.`
+Если поле не применимо — оставь пустым. Не выдумывай факты.
+Отвечай ТОЛЬКО валидным JSON.`;
 
-async function extractProtocol(text, config = {}) {
+async function extractProtocol(text) {
   if (!text.trim()) return null;
   try {
     const response = await fetch('http://localhost:11434/api/chat', {
@@ -182,7 +153,7 @@ async function extractProtocol(text, config = {}) {
       body: JSON.stringify({
         model: 'qwen3:8b',
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT + `\n\nПользовательские настройки протокола:\n- Приоритет по умолчанию: ${config.defaultPriority || 'medium'}\n- Фразы-триггеры для фиксации задач: ${config.triggerPhrases || 'любое явное обязательство выполнить действие'}\n- Шаблон задачи: ${config.taskTemplate || 'краткое действие + срок'}\nЕсли пользовательские настройки не противоречат фактам разговора, учитывай их при формировании tasks.` },
+          { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: `Транскрипт:\n\n${text}` }
         ],
         stream: false,
@@ -200,192 +171,32 @@ async function extractProtocol(text, config = {}) {
 }
 
 // === CRM / КАЛЕНДАРЬ ===
-function inferDeadlineFromTranscript(transcript, taskText) {
-  const text = String(transcript || '').toLowerCase().replace(/ё/g, 'е');
-  const task = String(taskText || '').toLowerCase().replace(/ё/g, 'е');
-  if (!text || !task) return null;
-
-  const hasTaskWord = (words) => words.some(w => task.includes(w));
-  if (hasTaskWord(['оплат'])) {
-    const m = text.match(/опла\w*[\s\S]{0,100}?\b(сегодня|завтра|послезавтра)(?:\s+(утром|днем|днём|вечером))?/i);
-    if (m) return `${m[1]}${m[2] ? ' ' + m[2] : ''}`;
-  }
-  if (hasTaskWord(['счет', 'счёт', 'почт'])) {
-    const m = text.match(/(?:счет|счёт|скину|отправлю|пришлю)[\s\S]{0,100}?\b(сегодня|завтра|послезавтра|в\s+(?:понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье))\b/i);
-    if (m) return m[1];
-  }
-  if (hasTaskWord(['достав'])) {
-    const m = text.match(/достав\w*[\s\S]{0,100}?\b(?:на\s+)?(сегодня|завтра|послезавтра|понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)([^.!?]{0,40})/i);
-    if (m) {
-      const day = m[1];
-      const nearbyTime = text.match(new RegExp(`(?:${day})[^.!?]{0,80}?(?:до|к|в)\\s+(?:\\d{1,2}(?::\\d{2})?|одного|два|двух|три|трех|четыре|четырех|пять|пяти|шесть|шести|семь|семи|восемь|восьми|девять|девяти|десять|десяти|одиннадцать|одиннадцати|двенадцать|двенадцати)(?:\\s+(?:час(?:а|ов)?|дня|вечера))?`, 'i'));
-      if (nearbyTime) return nearbyTime[0].trim();
-      return `${day}${m[2] || ''}`.trim();
-    }
-  }
-  return null;
-}
-
-function repairProtocolData(protocol, transcript, config = {}) {
-  const data = parseProtocol(protocol);
-  if (!data) return null;
-
-  const defaultPriority = ['low', 'medium', 'high'].includes(config.defaultPriority) ? config.defaultPriority : 'medium';
-  const allContracts = data.contracts || [];
-  const allTasks = [];
-  for (const contract of allContracts) {
-    contract.tasks = contract.tasks || [];
-    for (const task of contract.tasks) {
-      if (!['low', 'medium', 'high'].includes(task.priority)) task.priority = defaultPriority;
-      if (!task.deadline) {
-        const inferred = inferDeadlineFromTranscript(transcript, task.task);
-        if (inferred) task.deadline = inferred;
-      }
-      allTasks.push(task);
-    }
-  }
-
-  data.tasks = data.tasks || [];
-  for (const task of data.tasks) {
-    if (!['low', 'medium', 'high'].includes(task.priority)) task.priority = defaultPriority;
-    if (!task.deadline) {
-      const inferred = inferDeadlineFromTranscript(transcript, task.task);
-      if (inferred) task.deadline = inferred;
-    }
-    allTasks.push(task);
-  }
-
-  // Если LLM оставила поставку только в agreements, превращаем её в явную задачу.
-  const deliveryText = [...(data.agreements || []), ...allContracts.flatMap(c => c.agreements || [])]
-    .find(x => /достав\w*/i.test(String(x)) && /(пятниц|сред|четверг|завтра|сегодня|послезавтра)/i.test(String(x)));
-  const hasDeliveryTask = allTasks.some(t => /достав\w*/i.test(String(t.task || '')));
-  if (deliveryText && !hasDeliveryTask) {
-    const match = String(deliveryText).match(/достав\w*[^.!?]*(?:пятниц\w*|сред\w*|четверг\w*|завтра|сегодня|послезавтра)[^.!?]*/i);
-    const title = match ? match[0].replace(/\s+/g, ' ').trim() : String(deliveryText).trim();
-    const deadline = inferDeadlineFromTranscript(transcript, 'доставить');
-    const task = {
-      owner: 'менеджер',
-      task: /^достав/i.test(title) ? title : `Доставить товар: ${title}`,
-      deadline: deadline || null,
-      status: 'pending',
-      priority: defaultPriority,
-      contract_id: null,
-      contract_name: null
-    };
-    if (allContracts.length) {
-      allContracts[0].tasks = allContracts[0].tasks || [];
-      task.contract_id = allContracts[0].contract_id || null;
-      task.contract_name = allContracts[0].contract_name || null;
-      allContracts[0].tasks.push(task);
-    } else {
-      data.tasks.push(task);
-    }
-  }
-
-  data.contracts = allContracts;
-  return JSON.stringify(data);
-}
-
-function parseProtocol(protocol) {
+async function persistProtocol(protocol, callId) {
   try {
-    return JSON.parse(String(protocol).replace(/```json|```/g, '').trim());
-  } catch (e) {
-    console.error('[Protocol] Ошибка парсинга:', e.message);
-    return null;
-  }
-}
-
-function normalizeTaskText(text) {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/ё/g, 'е')
-    .replace(/[^а-яa-z0-9\s]/gi, ' ')
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(w => !new Set([
-      'пожалуйста', 'сегодня', 'завтра', 'утром', 'вечером', 'конца', 'дня',
-      'до', 'к', 'мне', 'тебе', 'вам', 'нам', 'тогда', 'потом', 'уже', 'все'
-    ]).has(w));
-}
-
-function sameContract(a, b) {
-  const aid = a.contract_id || a.contract_name || '';
-  const bid = b.contract_id || b.contract_name || '';
-  return !aid || !bid || aid === bid;
-}
-
-function taskLooksSame(a, b) {
-  if (!sameContract(a, b)) return false;
-  if (a.owner && b.owner && a.owner !== b.owner && a.owner !== 'не указано' && b.owner !== 'не указано') return false;
-  const aa = normalizeTaskText(a.task);
-  const bb = normalizeTaskText(b.task);
-  if (!aa.length || !bb.length) return false;
-  const setA = new Set(aa);
-  const setB = new Set(bb);
-  let common = 0;
-  for (const word of setA) if (setB.has(word)) common++;
-  const minSize = Math.min(setA.size, setB.size);
-  const union = new Set([...setA, ...setB]).size;
-  // Если одна формулировка практически является расширением другой
-  // («Пришлите новые исходники сегодня» -> «Пришлите новые исходники»),
-  // считаем это одной задачей.
-  return (common / minSize >= 0.75) || (common / union >= 0.55);
-}
-
-function normalizeEventText(text) {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/ё/g, 'е')
-    .replace(/[^а-яa-z0-9\s:]/gi, ' ')
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(w => !['сегодня','завтра','утром','вечером','до','к','в','на'].includes(w));
-}
-
-function eventLooksSame(a, b) {
-  const aa = normalizeEventText(a.title);
-  const bb = normalizeEventText(b.title);
-  if (!aa || !bb || a.time !== b.time) return false;
-  const setA = new Set(aa.split(' '));
-  const setB = new Set(bb.split(' '));
-  let common = 0;
-  for (const word of setA) if (setB.has(word)) common++;
-  return common / Math.min(setA.size, setB.size) >= 0.65;
-}
-
-function taskKey(callId, task) {
-  return JSON.stringify([
-    callId, task.contract_id || task.contract_name || '', task.owner || '',
-    normalizeTaskText(task.task).join(' '), task.deadline || ''
-  ]);
+    const parsed = JSON.parse(String(protocol).replace(/```json|```/g, '').trim());
+    await fetch("http://localhost:8000/protocol/structured", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({call_id:callId, ...parsed})});
+  } catch(e) { console.error("[Protocol API] Ошибка сохранения:", e.message); }
 }
 
 async function sendTasksToCRM(protocol, callId) {
-  const data = parseProtocol(protocol);
-  if (!data) return;
-
-  if (!sentTaskKeys.has(callId)) sentTaskKeys.set(callId, []);
-  const sent = sentTaskKeys.get(callId);
-
-  // Поддерживаем и новый contracts, и старый tasks.
-  const tasks = [];
+  if (!protocol) return;
+  let data;
+  try {
+    const clean = String(protocol).replace(/```json|```/g, '').trim();
+    data = JSON.parse(clean);
+  } catch (e) {
+    console.error('[CRM] Ошибка парсинга:', e.message);
+    return;
+  }
+  const allTasks = [...(data.tasks || [])];
   for (const contract of data.contracts || []) {
-    for (const task of contract.tasks || []) {
-      tasks.push({
-        ...task,
-        contract_id: task.contract_id ?? contract.contract_id ?? null,
-        contract_name: task.contract_name ?? contract.contract_name ?? null
-      });
-    }
+    for (const task of contract.tasks || []) allTasks.push({...task, contract_id: contract.contract_id, contract_name: contract.contract_name});
   }
-  for (const task of data.tasks || []) {
-    if (!tasks.some(x => taskKey(callId, x) === taskKey(callId, task))) tasks.push(task);
-  }
-
-  for (const task of tasks) {
-    const key = taskKey(callId, task);
-    if (sent.some(existing => taskLooksSame(existing.task, task))) continue;
-
+  if (!sentTaskKeys.has(callId)) sentTaskKeys.set(callId, new Set());
+  for (const task of allTasks) {
+    const key = [task.contract_id || '', task.owner || '', task.task || '', task.deadline || ''].join('|');
+    if (sentTaskKeys.get(callId).has(key)) continue;
+    sentTaskKeys.get(callId).add(key);
     try {
       const response = await fetch('http://localhost:8000/integrations/crm/task', {
         method: 'POST',
@@ -395,14 +206,13 @@ async function sendTasksToCRM(protocol, callId) {
           owner: task.owner || 'Не указано',
           task: task.task || '',
           deadline: task.deadline || null,
-          priority: task.priority || "medium",
           contract_id: task.contract_id || null,
-          contract_name: task.contract_name || null
+          contract_name: task.contract_name || null,
+          priority: task.priority || 'medium' 
         })
       });
       const result = await response.json();
-      if (response.ok) sent.push({ ...task, _key: key });
-      console.log(`[CRM] Задача "${task.task}" (${task.contract_id || 'без договора'}) → ${result.status}`);
+      console.log(`[CRM] Задача создана: "${task.task}" → ${result.status}`);
     } catch (e) {
       console.error('[CRM] Ошибка:', e.message);
     }
@@ -410,69 +220,32 @@ async function sendTasksToCRM(protocol, callId) {
 }
 
 async function sendEventsToCalendar(protocol, callId) {
-  const data = parseProtocol(protocol);
-  if (!data) return;
-
-  if (!sentEventKeys.has(callId)) sentEventKeys.set(callId, new Set());
-  const sent = sentEventKeys.get(callId);
-
+  if (!protocol) return;
+  let data;
+  try {
+    const clean = String(protocol).replace(/```json|```/g, '').trim();
+    data = JSON.parse(clean);
+  } catch (e) {
+    return;
+  }
   const meetingKeywords = ['встреч', 'конференц', 'созвон', 'звонок'];
-  const candidates = [];
-
-  for (const contract of data.contracts || []) {
-    for (const agreement of contract.agreements || []) {
-      if (meetingKeywords.some(kw => agreement.toLowerCase().includes(kw))) {
-        candidates.push({ title: agreement, time: agreement, contract });
-      }
-    }
-    for (const task of contract.tasks || []) {
-      if (task.deadline && /\d{1,2}(?::\d{2})?|\bк\b|\bв\b/i.test(String(task.deadline))) {
-        candidates.push({ title: task.task || 'Задача по договорённости', time: task.deadline, contract });
-      }
-    }
-  }
-
-  for (const task of data.tasks || []) {
-    if (task.deadline && /\d{1,2}(?::\d{2})?|\bк\b|\bв\b/i.test(String(task.deadline)) &&
-        !candidates.some(x => eventLooksSame(x, { title: task.task, time: task.deadline }))) {
-      candidates.push({ title: task.task || 'Задача по договорённости', time: task.deadline, contract: {} });
-    }
-  }
-
-  for (const agreement of data.agreements || []) {
-    if (meetingKeywords.some(kw => agreement.toLowerCase().includes(kw)) &&
-        !candidates.some(x => x.title === agreement)) {
-      candidates.push({ title: agreement, time: agreement, contract: {} });
-    }
-  }
-
-  const sentEvents = [...sent].map(key => {
-    try { const [storedCall, contractId, title, time] = JSON.parse(key); return { callId: storedCall, contractId, title, time }; } catch (_) { return null; }
-  }).filter(Boolean);
-
-  for (const { title, time, contract } of candidates) {
-    const contractId = contract.contract_id || contract.contract_name || '';
-    const eventKey = JSON.stringify([callId, contractId, title, time]);
-    if (sent.has(eventKey) || sentEvents.some(x => x.callId === callId && x.contractId === contractId && eventLooksSame(x, { title, time }))) continue;
-
+  const meetings = (data.agreements || []).filter(a =>
+    meetingKeywords.some(kw => a.toLowerCase().includes(kw))
+  );
+  for (const meeting of meetings) {
     try {
       const response = await fetch('http://localhost:8000/integrations/calendar/event', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           call_id: callId,
-          title,
-          time,
-          participants: (data.participants || []).map(p =>
-            typeof p === 'string' ? p : (p.name || p.role || '—'))
+          title: meeting,
+          time: meeting,
+          participants: (data.participants || []).map(p => typeof p === 'string' ? p : (p.name || p.role || '—'))
         })
       });
       const result = await response.json();
-      if (response.ok) {
-        sent.add(eventKey);
-        sentEvents.push({ callId, contractId, title, time });
-      }
-      console.log(`[Calendar] Событие (${contract.contract_id || 'без договора'}): ${result.ics_file}`);
+      console.log(`[Calendar] Событие: ${result.ics_file}`);
     } catch (e) {
       console.error('[Calendar] Ошибка:', e.message);
     }
@@ -493,27 +266,9 @@ function setupAudioHandler(wss) {
     buffers.set(callId, Buffer.alloc(0));
     transcripts.set(callId, '');
     chunkCounters.set(callId, 0);
-    sentTaskKeys.set(callId, []);
-    sentEventKeys.set(callId, new Set());
-    callConfigs.set(callId, { defaultPriority: 'medium', triggerPhrases: '', taskTemplate: '' });
 
     ws.on('message', async (data) => {
-      if (!Buffer.isBuffer(data)) {
-        try {
-          const message = JSON.parse(data.toString());
-          if (message.type === 'config') {
-            callConfigs.set(callId, {
-              defaultPriority: ['low', 'medium', 'high'].includes(message.defaultPriority) ? message.defaultPriority : 'medium',
-              triggerPhrases: String(message.triggerPhrases || '').slice(0, 500),
-              taskTemplate: String(message.taskTemplate || '').slice(0, 200)
-            });
-            console.log(`[Config] ${callId}: настройки протокола обновлены`);
-          }
-        } catch (e) {
-          console.error('[Audio] Ошибка config:', e.message);
-        }
-        return;
-      }
+      if (!Buffer.isBuffer(data)) return;
 
       let buffer = buffers.get(callId) || Buffer.alloc(0);
       buffer = Buffer.concat([buffer, data]);
@@ -548,9 +303,7 @@ function setupAudioHandler(wss) {
             chunkCounters.set(callId, cnt);
 
             if (cnt % PROTOCOL_INTERVAL_CHUNKS === 0) {
-              const config = callConfigs.get(callId) || {};
-              let protocol = await extractProtocol(updated, config);
-              protocol = repairProtocolData(protocol, updated, config) || protocol;
+              const protocol = await extractProtocol(updated);
               if (protocol && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                   type: 'protocol',
@@ -559,6 +312,7 @@ function setupAudioHandler(wss) {
                 }));
                 console.log(`[Protocol] ${callId}: обновление отправлено`);
 
+                await persistProtocol(protocol, callId);
                 await sendTasksToCRM(protocol, callId);
                 await sendEventsToCalendar(protocol, callId);
               }
@@ -576,14 +330,13 @@ function setupAudioHandler(wss) {
       console.log(`[Audio] Клиент отключён: ${callId}`);
 
       const transcript = transcripts.get(callId) || '';
-      const config = callConfigs.get(callId) || {};
-      let protocol = await extractProtocol(transcript, config);
-      protocol = repairProtocolData(protocol, transcript, config) || protocol;
+      const protocol = await extractProtocol(transcript);
       if (protocol) {
-        const outPath = path.join(OUTPUT_DIR, `${callId}_protocol.enc.json`);
-        fs.writeFileSync(outPath, encryptAtRest(protocol), 'utf-8');
+        const outPath = path.join(OUTPUT_DIR, `${callId}_protocol.txt`);
+        fs.writeFileSync(outPath, protocol, 'utf-8');
         console.log(`[Protocol] Финальный сохранён: ${outPath}`);
 
+        await persistProtocol(protocol, callId);
         await sendTasksToCRM(protocol, callId);
         await sendEventsToCalendar(protocol, callId);
       }
@@ -593,7 +346,6 @@ function setupAudioHandler(wss) {
       chunkCounters.delete(callId);
       sentTaskKeys.delete(callId);
       sentEventKeys.delete(callId);
-      callConfigs.delete(callId);
     });
 
     ws.on('error', (err) => {
@@ -604,4 +356,4 @@ function setupAudioHandler(wss) {
   console.log('[Audio] WebSocket-сервер для аудио готов');
 }
 
-module.exports = { setupAudioHandler, _test: { normalizeTaskText, taskLooksSame, taskKey, inferDeadlineFromTranscript, repairProtocolData, eventLooksSame } };
+module.exports = { setupAudioHandler };
