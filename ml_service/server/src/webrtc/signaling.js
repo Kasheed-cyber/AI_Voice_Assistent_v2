@@ -27,6 +27,18 @@ function setupSignaling(wss) {
                             }));
                         }
                     }
+                } else if (data.type === 'ai_notice') {
+                    // Уведомление о подключенной услуге ИИ до начала обработки разговора.
+                    console.log(`[Compliance] AI-уведомление отправлено участникам звонка ${data.callId || 'unknown'}`);
+                    for (const [otherId, client] of clients.entries()) {
+                        if (otherId !== clientId && client.ws.readyState === WebSocket.OPEN) {
+                            client.ws.send(JSON.stringify({
+                                type: 'ai_notice',
+                                callId: data.callId || null,
+                                text: data.text || 'Внимание: этот разговор обрабатывается ИИ для автоматической фиксации договорённостей.'
+                            }));
+                        }
+                    }
                 }
             } catch (err) {
                 console.error('[Signaling] Ошибка парсинга:', err.message);

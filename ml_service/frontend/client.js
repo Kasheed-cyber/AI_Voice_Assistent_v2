@@ -117,8 +117,26 @@ function renderProtocol(jsonString, isFinal) {
   }
 }
 
+// === УВЕДОМЛЕНИЕ ОБ ИИ-ОБРАБОТКЕ ===
+function isAiServiceEnabled() {
+  return document.getElementById('agentToggle')?.checked === true;
+}
+
+function showAiProcessingNotice() {
+  const text = 'Внимание: при подключенной услуге этот разговор обрабатывается ИИ для распознавания речи и автоматической фиксации договорённостей.';
+  const confirmed = window.confirm(text + '\n\nПродолжить звонок?');
+  if (confirmed) showToast('Участники уведомлены: разговор обрабатывается ИИ');
+  return confirmed;
+}
+
 // === СТАРТ ЗВОНКА ===
 async function startCall(selectedMode) {
+  if (isAiServiceEnabled() && !showAiProcessingNotice()) {
+    log('Звонок отменён: пользователь не подтвердил уведомление об ИИ-обработке');
+    setStatus('Ожидание подтверждения', 'error');
+    return;
+  }
+
   mode = selectedMode;
   setButtonsDisabled(true, true, false);
 
@@ -173,6 +191,11 @@ function connectSignaling() {
       log('Мой ID: ' + myId);
 
       if (mode === 'caller') {
+        if (isAiServiceEnabled()) {
+          const notice = 'Внимание: этот разговор обрабатывается ИИ для распознавания речи и автоматической фиксации договорённостей.';
+          signalingWs.send(JSON.stringify({ type: 'ai_notice', callId: myId, text: notice }));
+          log('⚖️ Уведомление об ИИ-обработке отправлено участникам');
+        }
         connectAudio();
       }
 
@@ -194,6 +217,11 @@ function connectSignaling() {
         log('Ошибка добавления ICE: ' + e.message);
       }
 
+    } else if (msg.type === 'ai_notice') {
+      const notice = msg.text || 'Внимание: этот разговор обрабатывается ИИ.';
+      log('⚖️ Уведомление: ' + notice);
+      showToast(notice);
+      setStatus('ИИ-обработка активна', 'connected');
     } else if (msg.type === 'peer-left') {
       log('Второй участник отключился');
       remoteVideo.srcObject = null;
@@ -401,7 +429,39 @@ agentToggle?.addEventListener('change', () => {
   showToast(enabled ? 'ИИ-агент договорённостей подключён' : 'ИИ-агент договорённостей выключен');
 });
 
-demoBtn?.addEventListener('click', () => {
+async function runRealDemo() {
+  const apiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
+  const callId = `demo-${Date.now()}`;
+  const sampleTranscript = `Менеджер: По договору номер 15 отправим коммерческое предложение до 10 октября.
+Клиент: Хорошо. Встречу по этому вопросу проведём 12 октября в 15:00.
+Менеджер: По договору 18 клиент подтвердит объём поставки до 20 октября.`;
+
+  try {
+    const response = await fetch(`${apiBase}/protocol/text`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({call_id: callId, text: sampleTranscript})
+    });
+    if (!response.ok) throw new Error(`API ${response.status}`);
+    const protocol = await response.json();
+    renderProtocol(JSON.stringify(protocol), true);
+    agreementBadge.textContent = String((protocol.tasks || []).length);
+    demoBtn.textContent = '✓ Открыть результат звонка';
+    demoBtn.dataset.resultReady = 'true';
+    showToast(`Реальный LLM-пайплайн нашёл ${(protocol.tasks || []).length} задач`);
+    showTab('agreements');
+  } catch (e) {
+    demoBtn.textContent = '✓ Открыть результат звонка';
+    demoBtn.dataset.resultReady = 'true';
+    agreementBadge.textContent = '4';
+    showToast('API/LLM недоступны — показан резервный сценарий прототипа');
+    showTab('agreements');
+  } finally {
+    demoBtn.disabled = false;
+  }
+}
+
+demoBtn?.addEventListener('click', async () => {
   if (demoBtn.dataset.resultReady === 'true') {
     showTab('agreements');
     return;
@@ -410,16 +470,10 @@ demoBtn?.addEventListener('click', () => {
     showToast('Сначала включите ИИ-агента');
     return;
   }
-  demoBtn.textContent = '● Идёт демонстрационный звонок…';
+  demoBtn.textContent = '● ИИ обрабатывает разговор…';
   demoBtn.disabled = true;
-  showToast('ИИ слушает разговор и фиксирует договорённости');
-  setTimeout(() => {
-    demoBtn.textContent = '✓ Открыть результат звонка';
-    demoBtn.disabled = false;
-    agreementBadge.textContent = '4';
-    demoBtn.dataset.resultReady = 'true';
-    showToast('Найдено 2 договора и 4 задачи');
-  }, 2200);
+  showToast('Отправляем тестовый разговор в реальный LLM-пайплайн');
+  await runRealDemo();
 });
 
 document.getElementById('transcriptBtn')?.addEventListener('click', () => {

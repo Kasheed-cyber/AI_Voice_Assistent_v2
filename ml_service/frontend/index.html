@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ИИ-агент договорённостей</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#111827">
 </head>
 <body>
   <div class="app-shell">
@@ -148,5 +150,6 @@
     <div class="toast" id="toast"></div>
   </div>
   <script src="client.js"></script>
+  <script>if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});</script>
 </body>
 </html>
