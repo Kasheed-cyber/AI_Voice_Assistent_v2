@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ИИ-агент договорённостей</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div>
+        <div class="brand-kicker">Мобильное приложение оператора</div>
+        <h1>Связь+ <span>ИИ-агент</span></h1>
+      </div>
+      <div class="header-status" id="serviceStatus"><span class="dot"></span> Сервис подключён</div>
+    </header>
+
+    <main>
+      <section class="service-card">
+        <div class="service-icon">✦</div>
+        <div class="service-copy">
+          <div class="eyebrow">Подключаемая услуга</div>
+          <h2>ИИ-агент договорённостей</h2>
+          <p>Во время звонка ИИ распознаёт речь и автоматически фиксирует задачи, сроки и договорённости.</p>
+        </div>
+        <label class="switch" title="Включить ИИ-агента">
+          <input type="checkbox" id="agentToggle" checked>
+          <span></span>
+        </label>
+      </section>
+
+      <nav class="tabs" aria-label="Основная навигация">
+        <button class="tab active" data-tab="home">Главная</button>
+        <button class="tab" data-tab="calls">Звонки</button>
+        <button class="tab" data-tab="agreements">Договорённости <b id="agreementBadge">3</b></button>
+        <button class="tab" data-tab="accuracy">Точность</button>
+        <button class="tab" data-tab="profile">Профиль</button>
+      </nav>
+
+      <section class="tab-page active" id="tab-home">
+        <div class="hero-card">
+          <div>
+            <div class="eyebrow">Автоматизация работы оператора</div>
+            <h2>Ничего не нужно записывать вручную</h2>
+            <p>Проведите обычный телефонный разговор. После звонка готовые договорённости появятся в отдельной вкладке.</p>
+            <button class="primary-btn" id="demoBtn">▶ Запустить демонстрационный звонок</button>
+          </div>
+          <div class="hero-phone">📱<div>Звонок<br><strong>+7 900 123-45-67</strong></div></div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-card"><strong id="statCalls">12</strong><span>звонков сегодня</span></div>
+          <div class="stat-card"><strong id="statAgreements">8</strong><span>договорённостей</span></div>
+          <div class="stat-card"><strong>2</strong><span>активных договора</span></div>
+        </div>
+
+        <div class="section-title"><h3>Последний разговор</h3><button class="text-btn" data-open="agreements">Все договорённости →</button></div>
+        <div class="call-preview">
+          <div class="avatar">Р</div>
+          <div class="call-main"><strong>ООО «Ромашка»</strong><span>Сегодня, 14:32 · 18 мин</span></div>
+          <div class="call-result">✓ 4 задачи</div>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-calls">
+        <div class="section-title"><h2>Звонки</h2><span class="muted">Последние разговоры</span></div>
+        <div class="call-list">
+          <div class="call-item"><div class="avatar">Р</div><div><strong>ООО «Ромашка»</strong><span>Сегодня, 14:32 · 18 мин</span></div><em>4 задачи</em></div>
+          <div class="call-item"><div class="avatar blue">А</div><div><strong>ООО «Альфа»</strong><span>Сегодня, 11:08 · 9 мин</span></div><em>2 задачи</em></div>
+          <div class="call-item"><div class="avatar orange">Т</div><div><strong>ООО «Техно»</strong><span>Вчера, 16:45 · 23 мин</span></div><em>3 задачи</em></div>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-agreements">
+        <div class="section-title"><div><h2>Договорённости</h2><span class="muted">Результаты ИИ после звонков</span></div><span class="ai-chip">✦ ИИ обработал</span></div>
+
+        <div class="result-banner"><div class="check">✓</div><div><strong>Разговор обработан</strong><span>2 договора · 4 договорённости · 4 задачи</span></div></div>
+
+        <div class="conversation-meta"><div class="avatar">Р</div><div><strong>ООО «Ромашка»</strong><span>Сегодня, 14:32 · 18 мин</span></div><button class="outline-btn" id="transcriptBtn">Расшифровка</button></div>
+
+        <div class="contract-card">
+          <div class="contract-head"><div><span class="contract-label">Договор</span><h3>№15 · Поставка оборудования</h3></div><span class="priority high">Высокий приоритет</span></div>
+          <div class="agreement"><span class="check-box">✓</span><div><strong>Отправить коммерческое предложение</strong><span>Срок: <b>10 октября</b> · Ответственный: оператор</span></div></div>
+          <div class="agreement"><span class="check-box">✓</span><div><strong>Уточнить количество принтеров</strong><span>Без фиксированного срока</span></div></div>
+        </div>
+
+        <div class="contract-card">
+          <div class="contract-head"><div><span class="contract-label">Договор</span><h3>№18 · Мониторы</h3></div><span class="priority medium">Средний приоритет</span></div>
+          <div class="agreement"><span class="check-box">✓</span><div><strong>Подтвердить объём поставки</strong><span>Срок: <b>20 октября</b> · Ответственный: оператор</span></div></div>
+          <div class="agreement"><span class="check-box">✓</span><div><strong>Согласовать итоговую цену</strong><span>После подтверждения количества</span></div></div>
+        </div>
+
+        <div class="manual-edit">
+          <div><strong>Нужно исправить результат?</strong><span>Договорённости можно отредактировать вручную.</span></div>
+          <button class="outline-btn" id="editBtn">✎ Редактировать</button>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-accuracy">
+        <div class="section-title"><div><h2>Тест точности</h2><span class="muted">Контроль качества ИИ перед запуском услуги</span></div><span class="ai-chip">Эталонный набор</span></div>
+        <div class="accuracy-hero">
+          <div class="accuracy-number">50</div>
+          <div><strong>тестовых разговоров</strong><span>Сценарии с датами, задачами и несколькими договорами в одном звонке.</span></div>
+        </div>
+        <div class="accuracy-grid">
+          <div class="metric"><span>ASR</span><strong>WER</strong><small>ошибка распознавания речи</small></div>
+          <div class="metric"><span>Извлечение</span><strong>Precision</strong><small>доля корректных договорённостей</small></div>
+          <div class="metric"><span>Извлечение</span><strong>Recall</strong><small>доля найденных договорённостей</small></div>
+          <div class="metric"><span>Группировка</span><strong>Contract Accuracy</strong><small>правильная привязка к договору</small></div>
+        </div>
+        <div class="test-method">
+          <h3>Как проходит проверка</h3>
+          <ol>
+            <li>Для каждого разговора заранее создаётся эталонная разметка: договор, задача, срок и ответственный.</li>
+            <li>Тот же аудиофайл проходит через ASR + LLM-пайплайн проекта.</li>
+            <li>Результат автоматически сравнивается с эталоном.</li>
+            <li>Отдельно проверяется ситуация «несколько договоров в одном разговоре».</li>
+          </ol>
+          <div class="target-note"><strong>Целевой показатель по ТЗ: ≥ 90%</strong><span>Фактический процент подставляется после прогона размеченного набора и не объявляется заранее.</span></div>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-profile">
+        <div class="section-title"><h2>Профиль и настройки</h2></div>
+        <div class="settings-card"><div><strong>ИИ-агент договорённостей</strong><span>Автоматически обрабатывать завершённые звонки</span></div><label class="switch"><input type="checkbox" checked><span></span></label></div>
+        <div class="settings-card"><div><strong>Приоритеты задач</strong><span>Определять приоритет по контексту разговора</span></div><span class="setting-value">Включено</span></div>
+        <div class="settings-card"><div><strong>Конфиденциальность</strong><span>Данные разговора используются для формирования протокола</span></div><span class="setting-value">Настроить →</span></div>
+      </section>
+
+      <section class="technical-panel">
+        <details>
+          <summary>Технический режим прототипа (WebRTC / ASR / LLM)</summary>
+          <div class="tech-actions">
+            <button id="callerBtn">Я звонящий (с микрофоном)</button>
+            <button id="listenerBtn">Я слушатель (без микрофона)</button>
+            <button id="stopBtn" disabled>Завершить</button>
+          </div>
+          <div class="status" id="status">Не подключён</div>
+          <div class="videos"><video id="localVideo" autoplay muted playsinline></video><video id="remoteVideo" autoplay playsinline></video></div>
+          <div id="transcript" class="panel"><h3>📝 Транскрипт</h3></div>
+          <div id="protocol" class="panel"><h3>📄 Протокол</h3></div>
+          <div class="log"><h3>Лог</h3><pre id="log"></pre></div>
+        </details>
+      </section>
+    </main>
+
+    <div class="toast" id="toast"></div>
+  </div>
+  <script src="client.js"></script>
+</body>
+</html>

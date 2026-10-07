@@ -1,0 +1,436 @@
+// === НАСТРОЙКИ ===
+const HOST = window.location.host;
+const SIGNALING_URL = 'ws://' + HOST + '/ws/signaling';
+const AUDIO_URL = 'ws://' + HOST + '/ws/audio';
+
+const ICE_CONFIG = {
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+};
+
+// === СОСТОЯНИЕ ===
+let signalingWs = null;
+let audioWs = null;
+let pc = null;
+let localStream = null;
+let audioContext = null;
+let processor = null;
+let myId = null;
+let mode = null;
+let audioProcessCalls = 0;
+let audioBytesSent = 0;
+
+// === ЭЛЕМЕНТЫ UI ===
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const callerBtn = document.getElementById('callerBtn');
+const listenerBtn = document.getElementById('listenerBtn');
+const stopBtn = document.getElementById('stopBtn');
+const localVideo = document.getElementById('localVideo');
+const remoteVideo = document.getElementById('remoteVideo');
+
+// === ВСПОМОГАТЕЛЬНЫЕ ===
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  logEl.textContent += `[${time}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(msg);
+}
+
+function setStatus(text, cls = '') {
+  statusEl.textContent = text;
+  statusEl.className = 'status ' + cls;
+}
+
+function setButtonsDisabled(callerDisabled, listenerDisabled, stopDisabled) {
+  callerBtn.disabled = callerDisabled;
+  listenerBtn.disabled = listenerDisabled;
+  stopBtn.disabled = stopDisabled;
+}
+
+// === UI: ТРАНСКРИПТ ===
+function appendTranscript(text) {
+  let el = document.getElementById('transcript');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'transcript';
+    el.className = 'panel';
+    document.body.appendChild(el);
+  }
+  const line = document.createElement('div');
+  line.textContent = '📝 ' + text;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+// === UI: ПРОТОКОЛ ===
+function renderProtocol(jsonString, isFinal) {
+  let el = document.getElementById('protocol');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'protocol';
+    el.className = 'panel';
+    document.body.appendChild(el);
+  }
+  try {
+    const clean = String(jsonString).replace(/```json|```/g, '').trim();
+    const data = JSON.parse(clean);
+    const contracts = data.contracts || [];
+    const contractsHtml = contracts.length
+      ? contracts.map((c, i) => {
+          const agreements = (c.agreements || []).map(a => `<li>${a}</li>`).join('') || '<li>—</li>';
+          const facts = (c.facts || []).map(f => `<li>${f}</li>`).join('');
+          const tasks = (c.tasks || []).map(t =>
+            `<li><b>${t.owner || '—'}</b>: ${t.task || '—'} <i>(${t.deadline || 'без срока'})</i></li>`
+          ).join('') || '<li>—</li>';
+          return `
+            <div class="contract">
+              <h4>📑 Договор/сделка ${i + 1}: ${c.contract_id || c.contract_name || 'без идентификатора'}</h4>
+              ${c.contract_name && c.contract_id ? `<p><b>Название:</b> ${c.contract_name}</p>` : ''}
+              <p><b>Договорённости:</b></p><ul>${agreements}</ul>
+              ${facts ? `<p><b>Условия / суммы:</b></p><ul>${facts}</ul>` : ''}
+              <p><b>Задачи:</b></p><ul>${tasks}</ul>
+            </div>`;
+        }).join('')
+      : '<p>Договоры/сделки отдельно не определены.</p>';
+
+    const agreements = (data.agreements || []).map(a => `<li>${a}</li>`).join('') || '<li>—</li>';
+    const facts = (data.facts || []).map(f => `<li>${f}</li>`).join('') || '<li>—</li>';
+    const tasks = (data.tasks || [])
+      .map(t => `<li><b>${t.owner || '—'}</b>: ${t.task || '—'} <i>(${t.deadline || 'без срока'})</i> ${t.contract_id ? `[${t.contract_id}]` : ''}</li>`)
+      .join('') || '<li>—</li>';
+    const keyPoints = (data.key_points || []).map(k => `<li>${k}</li>`).join('') || '<li>—</li>';
+
+    el.innerHTML = `
+      <h3>${isFinal ? '📄 Финальный протокол' : '📄 Протокол (обновляется)'}</h3>
+      <p><b>Тема:</b> ${data.topic || '—'}</p>
+      <p><b>Участники:</b> ${(data.participants || []).map(p => typeof p === 'string' ? p : (p.name || p.role || '—')).join(', ') || '—'}</p>
+      <h4>📚 Договоры и сделки</h4>
+      ${contractsHtml}
+      <details><summary>Все договорённости</summary><ul>${agreements}</ul></details>
+      <details><summary>Условия, суммы и количества</summary><ul>${facts}</ul></details>
+      <details><summary>Все задачи</summary><ul>${tasks}</ul></details>
+      <p><b>Ключевые моменты:</b></p>
+      <ul>${keyPoints}</ul>
+    `;
+  } catch (e) {
+    el.innerHTML = `<h3>📄 Протокол</h3><pre>${jsonString}</pre>`;
+  }
+}
+
+// === СТАРТ ЗВОНКА ===
+async function startCall(selectedMode) {
+  mode = selectedMode;
+  setButtonsDisabled(true, true, false);
+
+  try {
+    if (mode === 'caller') {
+      setStatus('Запрос доступа к микрофону...');
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        },
+        video: true
+      });
+      localVideo.srcObject = localStream;
+      log('Микрофон и камера получены (режим: звонящий)');
+    } else {
+      setStatus('Запрос доступа к камере (без микрофона)...');
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: true
+      });
+      localVideo.srcObject = localStream;
+      log('Камера получена (режим: слушатель, без микрофона)');
+    }
+
+    connectSignaling();
+
+  } catch (err) {
+    log('Ошибка доступа к медиа: ' + err.message);
+    setStatus('Ошибка: ' + err.message, 'error');
+    setButtonsDisabled(false, false, true);
+  }
+}
+
+// === СИГНАЛИЗАЦИЯ ===
+function connectSignaling() {
+  signalingWs = new WebSocket(SIGNALING_URL);
+
+  signalingWs.onopen = () => {
+    log('Signaling: подключено');
+    setStatus('Ожидание второго участника...');
+  };
+
+  signalingWs.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+    log('Signaling ← ' + msg.type);
+
+    if (msg.type === 'init') {
+      myId = msg.id;
+      log('Мой ID: ' + myId);
+
+      if (mode === 'caller') {
+        connectAudio();
+      }
+
+      await createPeerConnection();
+
+    } else if (msg.type === 'offer') {
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      signalingWs.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription }));
+
+    } else if (msg.type === 'answer') {
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+
+    } else if (msg.type === 'candidate') {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      } catch (e) {
+        log('Ошибка добавления ICE: ' + e.message);
+      }
+
+    } else if (msg.type === 'peer-left') {
+      log('Второй участник отключился');
+      remoteVideo.srcObject = null;
+    }
+  };
+
+  signalingWs.onerror = () => {
+    log('Signaling ошибка');
+    setStatus('Ошибка сигнализации', 'error');
+  };
+
+  signalingWs.onclose = () => {
+    log('Signaling закрыто');
+  };
+}
+
+// === WebRTC ===
+async function createPeerConnection() {
+  pc = new RTCPeerConnection(ICE_CONFIG);
+
+  localStream.getTracks().forEach(track => {
+    pc.addTrack(track, localStream);
+  });
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate && signalingWs.readyState === WebSocket.OPEN) {
+      signalingWs.send(JSON.stringify({
+        type: 'candidate',
+        candidate: event.candidate
+      }));
+    }
+  };
+
+  pc.ontrack = (event) => {
+    log('Получен удалённый трек: ' + event.track.kind);
+    if (event.streams[0]) {
+      remoteVideo.srcObject = event.streams[0];
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    log('WebRTC состояние: ' + pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      setStatus('Соединение установлено (' + mode + ')', 'connected');
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  signalingWs.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription }));
+
+  if (mode === 'caller') {
+    startAudioCapture();
+  }
+}
+
+// === АУДИО-КАНАЛ ===
+function connectAudio() {
+  const url = `${AUDIO_URL}?call_id=${myId}`;
+  audioWs = new WebSocket(url);
+  audioWs.binaryType = 'arraybuffer';   // ⚠️ важно для отправки бинарных данных
+
+  audioWs.onopen = () => {
+    log('Audio: подключено к серверу (отправка чанков)');
+  };
+
+  audioWs.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'transcript') {
+        log(`📝 ${msg.text}`);
+        appendTranscript(msg.text);
+      } else if (msg.type === 'protocol') {
+        log(`📄 Протокол обновлён (final=${msg.final})`);
+        renderProtocol(msg.content, msg.final);
+      }
+    } catch (e) {
+      log('Audio msg parse error: ' + e.message);
+    }
+  };
+
+  audioWs.onerror = (e) => {
+    log('Audio: ошибка ' + (e.message || ''));
+  };
+
+  audioWs.onclose = () => {
+    log('Audio: закрыто');
+  };
+}
+
+// === ЗАХВАТ И ОТПРАВКА PCM ===
+function startAudioCapture() {
+  audioContext = new AudioContext({ sampleRate: 16000 });
+  log(`AudioContext: state=${audioContext.state}, sampleRate=${audioContext.sampleRate}`);
+
+  const source = audioContext.createMediaStreamSource(localStream);
+  processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+  processor.onaudioprocess = (event) => {
+    audioProcessCalls++;
+
+    if (!audioWs) {
+      if (audioProcessCalls % 40 === 0) log('⚠️ audioWs = null');
+      return;
+    }
+    if (audioWs.readyState !== WebSocket.OPEN) {
+      if (audioProcessCalls % 40 === 0) log(`⚠️ audioWs.state=${audioWs.readyState}`);
+      return;
+    }
+
+    try {
+      const inputData = event.inputBuffer.getChannelData(0);
+      const pcm16 = float32ToInt16(inputData);
+
+      if (audioProcessCalls % 10 === 0) {
+        log(`📤 Sending ${pcm16.byteLength} bytes (#${audioProcessCalls})`);
+      }
+
+      audioWs.send(pcm16);
+      audioBytesSent += pcm16.byteLength;
+
+      if (audioProcessCalls % 10 === 0) {
+        log(`✅ Total sent: ${audioBytesSent} bytes`);
+      }
+    } catch (e) {
+      log(`❌ send error: ${e.message}`);
+    }
+  };
+
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+
+  audioContext.resume().then(() => {
+    log(`✅ AudioContext возобновлён: state=${audioContext.state}`);
+  }).catch(err => {
+    log(`❌ AudioContext resume failed: ${err.message}`);
+  });
+
+  log('Захват аудио запущен');
+}
+
+function float32ToInt16(float32Array) {
+  const int16 = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return int16.buffer;
+}
+
+// === ЗАВЕРШЕНИЕ ===
+function stopCall() {
+  if (processor) processor.disconnect();
+  if (audioContext) audioContext.close();
+  if (pc) pc.close();
+  if (signalingWs) signalingWs.close();
+  if (audioWs) audioWs.close();
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+
+  localVideo.srcObject = null;
+  remoteVideo.srcObject = null;
+
+  setButtonsDisabled(false, false, true);
+  setStatus('Звонок завершён');
+  log('Звонок завершён');
+}
+
+// === ОБРАБОТЧИКИ ===
+callerBtn.addEventListener('click', () => startCall('caller'));
+listenerBtn.addEventListener('click', () => startCall('listener'));
+stopBtn.addEventListener('click', stopCall);
+
+
+
+// === ДЕМО-ОБОЛОЧКА МОБИЛЬНОГО ПРИЛОЖЕНИЯ ===
+const tabs = document.querySelectorAll('.tab');
+const pages = document.querySelectorAll('.tab-page');
+const toast = document.getElementById('toast');
+const agentToggle = document.getElementById('agentToggle');
+const demoBtn = document.getElementById('demoBtn');
+const agreementBadge = document.getElementById('agreementBadge');
+
+function showTab(name) {
+  tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.tab === name));
+  pages.forEach(page => page.classList.toggle('active', page.id === `tab-${name}`));
+}
+
+tabs.forEach(tab => tab.addEventListener('click', () => showTab(tab.dataset.tab)));
+document.querySelectorAll('[data-open]').forEach(btn => btn.addEventListener('click', () => showTab(btn.dataset.open)));
+
+function showToast(message) {
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.add('show');
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => toast.classList.remove('show'), 2600);
+}
+
+agentToggle?.addEventListener('change', () => {
+  const enabled = agentToggle.checked;
+  const serviceStatus = document.getElementById('serviceStatus');
+  serviceStatus.innerHTML = enabled
+    ? '<span class="dot"></span> Сервис подключён'
+    : '<span class="dot" style="background:#9aa2ad"></span> Сервис выключен';
+  showToast(enabled ? 'ИИ-агент договорённостей подключён' : 'ИИ-агент договорённостей выключен');
+});
+
+demoBtn?.addEventListener('click', () => {
+  if (demoBtn.dataset.resultReady === 'true') {
+    showTab('agreements');
+    return;
+  }
+  if (!agentToggle.checked) {
+    showToast('Сначала включите ИИ-агента');
+    return;
+  }
+  demoBtn.textContent = '● Идёт демонстрационный звонок…';
+  demoBtn.disabled = true;
+  showToast('ИИ слушает разговор и фиксирует договорённости');
+  setTimeout(() => {
+    demoBtn.textContent = '✓ Открыть результат звонка';
+    demoBtn.disabled = false;
+    agreementBadge.textContent = '4';
+    demoBtn.dataset.resultReady = 'true';
+    showToast('Найдено 2 договора и 4 задачи');
+  }, 2200);
+});
+
+document.getElementById('transcriptBtn')?.addEventListener('click', () => {
+  const panel = document.getElementById('transcript');
+  panel?.scrollIntoView({behavior:'smooth'});
+  document.querySelector('.technical-panel')?.setAttribute('open','');
+  showToast('Расшифровка доступна в техническом режиме прототипа');
+});
+
+document.getElementById('editBtn')?.addEventListener('click', () => {
+  showToast('Режим редактирования: здесь оператор сможет изменить задачу или срок');
+});
+
+log('Клиент готов. Мобильный режим прототипа активен.');

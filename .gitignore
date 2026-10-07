@@ -1,0 +1,42 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Данные (не коммитим пользовательские данные)
+data/protocols/
+data/mock/
+data/input/
+data/output/
+
+# Ollama и модели
+*.gguf
+*.onnx
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Секреты
+.env
+.env.local
+*.key
+*.pem
+
+# Временные файлы
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
