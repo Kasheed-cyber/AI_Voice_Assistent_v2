@@ -55,8 +55,29 @@ def save_structured(payload: dict):
 
 @router.post('/text', response_model=Protocol)
 def process_text(request: TextTranscriptRequest):
-    from app.llm import extract_protocol
-    extracted = extract_protocol(request.text); return storage.merge_protocol(request.call_id, extracted)
+    try:
+        from app.llm import extract_protocol
+    except ImportError as e:
+        raise HTTPException(503, f'LLM dependency unavailable: {e}')
+    extracted = extract_protocol(request.text)
+    if not extracted:
+        raise HTTPException(503, 'LLM не вернула результат')
+    return storage.merge_protocol(request.call_id, extracted)
+
+@router.post('/analyze')
+def analyze_text(request: TextTranscriptRequest):
+    """Итоговый AI-анализ полного транскрипта без отдельного сохранения результата."""
+    try:
+        from app.llm import extract_protocol
+    except ImportError as e:
+        raise HTTPException(503, f'LLM dependency unavailable: {e}')
+    try:
+        extracted = extract_protocol(request.text)
+    except Exception as e:
+        raise HTTPException(503, f'LLM недоступна: {e}')
+    if not extracted:
+        raise HTTPException(503, 'LLM недоступна или не вернула результат')
+    return {'call_id': request.call_id, 'protocol': extracted}
 
 @router.post('/chunk')
 def process_audio_chunk(request: AudioChunkRequest): return {'status':'ok','call_id':request.call_id,'chunk_index':request.chunk_index}

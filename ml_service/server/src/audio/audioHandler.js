@@ -7,7 +7,6 @@ const { spawn } = require('child_process');
 const SAMPLE_RATE = 16000;
 const CHUNK_SECONDS = 5;
 const BUFFER_SIZE = SAMPLE_RATE * 2 * CHUNK_SECONDS;
-const PROTOCOL_INTERVAL_CHUNKS = 3;
 
 // === ПУТИ ===
 const ML_DIR = path.join(__dirname, '..', '..', '..');
@@ -19,9 +18,7 @@ const OUTPUT_DIR = path.join(PROJECT_ROOT, 'data', 'protocols');
 // === СОСТОЯНИЕ ===
 const buffers = new Map();
 const transcripts = new Map();
-const chunkCounters = new Map();
-const sentTaskKeys = new Map();
-const sentEventKeys = new Map();
+const finalizingCalls = new Set();
 
 // === PYTHON SERVICE ===
 let pyService = null;
@@ -122,50 +119,26 @@ function pcmToWavBuffer(pcmBuffer) {
   return Buffer.concat([header, pcmBuffer]);
 }
 
-// === LLM ===
-const SYSTEM_PROMPT = `Ты — ассистент, который протоколирует деловые телефонные разговоры.
-Извлеки:
-1. Участников ("Абонент", "Собеседник", если имена не названы)
-2. Договорённости (что решили)
-3. Задачи (кто, что, к какому сроку)
-4. Ключевые темы
-5. Если в разговоре обсуждается несколько договоров или сделок, ОБЯЗАТЕЛЬНО раздели их. Не смешивай задачи разных договоров.
-
-Формат ответа — строго JSON:
-{
-  "topic": "тема",
-  "participants": ["роль1", "роль2"],
-  "contracts": [{"contract_id":"15","contract_name":"Договор №15","agreements":["договорённость"],"tasks":[{"owner":"кто","task":"что","deadline":"когда","priority":"medium"}]}],
-  "agreements": ["договорённость 1"],
-  "tasks": [{"owner": "кто", "task": "что", "deadline": "когда"}],
-  "key_points": ["мысль 1"]
-}
-
-Если поле не применимо — оставь пустым. Не выдумывай факты.
-Отвечай ТОЛЬКО валидным JSON.`;
-
-async function extractProtocol(text) {
-  if (!text.trim()) return null;
+// === AI АНАЛИЗ ===
+// Единая точка анализа — FastAPI /protocol/analyze. Это исключает расхождение
+// промтов между Node и backend и позволяет применять один и тот же валидатор Qwen.
+async function extractProtocol(text, callId='unknown') {
+  if (!String(text || '').trim()) return null;
   try {
-    const response = await fetch('http://localhost:11434/api/chat', {
+    const response = await fetch('http://localhost:8000/protocol/analyze', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'qwen3:8b',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: `Транскрипт:\n\n${text}` }
-        ],
-        stream: false,
-        think: false,
-        keep_alive: '0',
-        options: { temperature: 0.2, num_ctx: 8192 }
-      })
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({call_id: callId, text: String(text)})
     });
-    const data = await response.json();
-    return data.message?.content || null;
+    if (!response.ok) {
+      const body = await response.text();
+      console.error('[Protocol] API error:', response.status, body.slice(0,300));
+      return null;
+    }
+    const result = await response.json();
+    return result?.protocol ? JSON.stringify(result.protocol) : null;
   } catch (e) {
-    console.error('[Protocol] Ollama error:', e.message);
+    console.error('[Protocol] AI API error:', e.message);
     return null;
   }
 }
@@ -176,80 +149,6 @@ async function persistProtocol(protocol, callId) {
     const parsed = JSON.parse(String(protocol).replace(/```json|```/g, '').trim());
     await fetch("http://localhost:8000/protocol/structured", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({call_id:callId, ...parsed})});
   } catch(e) { console.error("[Protocol API] Ошибка сохранения:", e.message); }
-}
-
-async function sendTasksToCRM(protocol, callId) {
-  if (!protocol) return;
-  let data;
-  try {
-    const clean = String(protocol).replace(/```json|```/g, '').trim();
-    data = JSON.parse(clean);
-  } catch (e) {
-    console.error('[CRM] Ошибка парсинга:', e.message);
-    return;
-  }
-  const allTasks = [...(data.tasks || [])];
-  for (const contract of data.contracts || []) {
-    for (const task of contract.tasks || []) allTasks.push({...task, contract_id: contract.contract_id, contract_name: contract.contract_name});
-  }
-  if (!sentTaskKeys.has(callId)) sentTaskKeys.set(callId, new Set());
-  for (const task of allTasks) {
-    const key = [task.contract_id || '', task.owner || '', task.task || '', task.deadline || ''].join('|');
-    if (sentTaskKeys.get(callId).has(key)) continue;
-    sentTaskKeys.get(callId).add(key);
-    try {
-      const response = await fetch('http://localhost:8000/integrations/crm/task', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          call_id: callId,
-          owner: task.owner || 'Не указано',
-          task: task.task || '',
-          deadline: task.deadline || null,
-          contract_id: task.contract_id || null,
-          contract_name: task.contract_name || null,
-          priority: task.priority || 'medium' 
-        })
-      });
-      const result = await response.json();
-      console.log(`[CRM] Задача создана: "${task.task}" → ${result.status}`);
-    } catch (e) {
-      console.error('[CRM] Ошибка:', e.message);
-    }
-  }
-}
-
-async function sendEventsToCalendar(protocol, callId) {
-  if (!protocol) return;
-  let data;
-  try {
-    const clean = String(protocol).replace(/```json|```/g, '').trim();
-    data = JSON.parse(clean);
-  } catch (e) {
-    return;
-  }
-  const meetingKeywords = ['встреч', 'конференц', 'созвон', 'звонок'];
-  const meetings = (data.agreements || []).filter(a =>
-    meetingKeywords.some(kw => a.toLowerCase().includes(kw))
-  );
-  for (const meeting of meetings) {
-    try {
-      const response = await fetch('http://localhost:8000/integrations/calendar/event', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          call_id: callId,
-          title: meeting,
-          time: meeting,
-          participants: (data.participants || []).map(p => typeof p === 'string' ? p : (p.name || p.role || '—'))
-        })
-      });
-      const result = await response.json();
-      console.log(`[Calendar] Событие: ${result.ics_file}`);
-    } catch (e) {
-      console.error('[Calendar] Ошибка:', e.message);
-    }
-  }
 }
 
 // === ОСНОВНОЙ ОБРАБОТЧИК ===
@@ -265,10 +164,63 @@ function setupAudioHandler(wss) {
     console.log(`[Audio] Клиент подключён: ${callId}`);
     buffers.set(callId, Buffer.alloc(0));
     transcripts.set(callId, '');
-    chunkCounters.set(callId, 0);
 
-    ws.on('message', async (data) => {
-      if (!Buffer.isBuffer(data)) return;
+    ws.on('message', async (data, isBinary) => {
+      // Клиент сначала присылает команду finalize, и только после получения
+      // итогового протокола закрывает WebSocket. Это устраняет гонку между
+      // закрытием сокета и медленным анализом Qwen.
+      if (!isBinary) {
+        try {
+          const control = JSON.parse(String(data));
+          if (control?.type === 'finalize') {
+            if (finalizingCalls.has(callId)) return;
+            finalizingCalls.add(callId);
+            console.log(`[Protocol] Получена команда finalize: ${callId}`);
+
+            let transcript = transcripts.get(callId) || '';
+            const remaining = buffers.get(callId) || Buffer.alloc(0);
+            if (remaining.length > 3200) {
+              try {
+                const wavBuffer = pcmToWavBuffer(remaining);
+                const result = await sendToPython({action:'transcribe', wav_base64:wavBuffer.toString('base64')});
+                if (result?.text) {
+                  transcript = `${transcript} ${result.text}`.trim();
+                  transcripts.set(callId, transcript);
+                  console.log(`[GigaAM] ${callId}: "${result.text}" (финальный фрагмент)`);
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({type:'transcript', text:result.text, duration:result.duration, final:true}));
+                  }
+                }
+              } catch (e) {
+                console.error(`[GigaAM] Финальный фрагмент не распознан: ${e.message}`);
+              }
+            }
+
+            const protocol = await extractProtocol(transcript, callId);
+            if (protocol) {
+              const outPath = path.join(OUTPUT_DIR, `${callId}_protocol.txt`);
+              fs.writeFileSync(outPath, protocol, 'utf-8');
+              console.log(`[Protocol] Финальный сохранён: ${outPath}`);
+              try {
+                const parsed = JSON.parse(protocol);
+                const agreementsCount = Array.isArray(parsed.agreements) ? parsed.agreements.length : 0;
+                const contractsCount = Array.isArray(parsed.contracts) ? parsed.contracts.length : 0;
+                console.log(`[Protocol] AI-результат: договоров=${contractsCount}, договорённостей=${agreementsCount}`);
+              } catch {}
+              await persistProtocol(protocol, callId);
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type:'final_protocol', content:protocol}));
+              }
+            } else if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({type:'final_protocol_error', message:'Qwen не вернул результат анализа'}));
+            }
+            return;
+          }
+        } catch (_) {
+          // Не JSON-команда — игнорируем.
+        }
+        return;
+      }
 
       let buffer = buffers.get(callId) || Buffer.alloc(0);
       buffer = Buffer.concat([buffer, data]);
@@ -299,24 +251,7 @@ function setupAudioHandler(wss) {
             }
             console.log(`[GigaAM] ${callId}: "${result.text}"`);
 
-            const cnt = (chunkCounters.get(callId) || 0) + 1;
-            chunkCounters.set(callId, cnt);
-
-            if (cnt % PROTOCOL_INTERVAL_CHUNKS === 0) {
-              const protocol = await extractProtocol(updated);
-              if (protocol && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                  type: 'protocol',
-                  content: protocol,
-                  final: false
-                }));
-                console.log(`[Protocol] ${callId}: обновление отправлено`);
-
-                await persistProtocol(protocol, callId);
-                await sendTasksToCRM(protocol, callId);
-                await sendEventsToCalendar(protocol, callId);
-              }
-            }
+      
           } else if (result && result.error) {
             console.error(`[GigaAM] Ошибка: ${result.error}`);
           }
@@ -329,23 +264,35 @@ function setupAudioHandler(wss) {
     ws.on('close', async () => {
       console.log(`[Audio] Клиент отключён: ${callId}`);
 
-      const transcript = transcripts.get(callId) || '';
-      const protocol = await extractProtocol(transcript);
-      if (protocol) {
-        const outPath = path.join(OUTPUT_DIR, `${callId}_protocol.txt`);
-        fs.writeFileSync(outPath, protocol, 'utf-8');
-        console.log(`[Protocol] Финальный сохранён: ${outPath}`);
-
-        await persistProtocol(protocol, callId);
-        await sendTasksToCRM(protocol, callId);
-        await sendEventsToCalendar(protocol, callId);
+      // Если финализация уже была запрошена, анализ выполнен выше.
+      // Нельзя запускать Qwen второй раз при закрытии сокета.
+      if (!finalizingCalls.has(callId)) {
+        let transcript = transcripts.get(callId) || '';
+        const remaining = buffers.get(callId) || Buffer.alloc(0);
+        if (remaining.length > 3200) {
+          try {
+            const wavBuffer = pcmToWavBuffer(remaining);
+            const result = await sendToPython({action:'transcribe', wav_base64:wavBuffer.toString('base64')});
+            if (result?.text) {
+              transcript = `${transcript} ${result.text}`.trim();
+              console.log(`[GigaAM] ${callId}: "${result.text}" (финальный фрагмент)`);
+            }
+          } catch (e) {
+            console.error(`[GigaAM] Финальный фрагмент не распознан: ${e.message}`);
+          }
+        }
+        const protocol = await extractProtocol(transcript, callId);
+        if (protocol) {
+          const outPath = path.join(OUTPUT_DIR, `${callId}_protocol.txt`);
+          fs.writeFileSync(outPath, protocol, 'utf-8');
+          console.log(`[Protocol] Финальный сохранён: ${outPath}`);
+          await persistProtocol(protocol, callId);
+        }
       }
 
       buffers.delete(callId);
       transcripts.delete(callId);
-      chunkCounters.delete(callId);
-      sentTaskKeys.delete(callId);
-      sentEventKeys.delete(callId);
+      finalizingCalls.delete(callId);
     });
 
     ws.on('error', (err) => {

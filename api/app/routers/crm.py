@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 
 router = APIRouter(prefix='/integrations', tags=['integrations'])
-MOCK_DIR = Path(__file__).parent.parent.parent.parent / 'data' / 'mock'
+MOCK_DIR = Path(__file__).resolve().parents[3] / 'data' / 'mock'
 MOCK_DIR.mkdir(parents=True, exist_ok=True)
 TASKS_FILE = MOCK_DIR / 'crm_tasks.json'
 EVENTS_FILE = MOCK_DIR / 'calendar_events.json'
@@ -28,6 +28,12 @@ def create_crm_task(request: CRMTaskRequest):
 @router.get('/crm/tasks')
 def list_crm_tasks():
     tasks = read(TASKS_FILE); return {'tasks': tasks, 'total': len(tasks)}
+
+@router.delete('/crm/tasks')
+def clear_crm_tasks():
+    write(TASKS_FILE, [])
+    storage.audit('crm_tasks_cleared', 'crm')
+    return {'status': 'cleared', 'total': 0}
 
 @router.patch('/crm/task/{task_id}')
 def update_crm_task(task_id: str, payload: dict):
@@ -58,6 +64,15 @@ def create_calendar_event(request: CalendarEventRequest):
 @router.get('/calendar/events')
 def list_calendar_events():
     events = read(EVENTS_FILE); return {'events': events, 'total': len(events)}
+
+@router.delete('/calendar/events')
+def clear_calendar_events():
+    write(EVENTS_FILE, [])
+    for f in MOCK_DIR.glob('event_event_*.ics'):
+        try: f.unlink()
+        except OSError: pass
+    storage.audit('calendar_events_cleared', 'calendar')
+    return {'status': 'cleared', 'total': 0}
 
 @router.delete('/calendar/event/{event_id}')
 def delete_calendar_event(event_id: str):
