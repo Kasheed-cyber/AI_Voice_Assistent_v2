@@ -4,8 +4,8 @@ const SIGNALING_URL=`${location.protocol==='https:'?'wss':'ws'}://${HOST}/ws/sig
 const AUDIO_URL=`${location.protocol==='https:'?'wss':'ws'}://${HOST}/ws/audio`;
 const STORAGE_KEY='ai_voice_agreements_v3', CALLS_KEY='ai_voice_calls_v3', SETTINGS_KEY='ai_voice_settings_v3';
 const ICE_CONFIG={iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
-let signalingWs=null,audioWs=null,pc=null,localStream=null,audioContext=null,processor=null,myId=null,mode=null;
-let timerId=null,timerSeconds=0,activeCallId=null,demoTimers=[],lastProtocol=null,lastTranscript='',currentCallStarted=null,currentDetected=null,lastLiveContract=null,liveAnalysisTimer=null,settings=loadSettings(),audioFinalizePromise=null,audioFinalizeResolve=null,audioFinalizeReject=null;
+let signalingWs=null,audioWs=null,pc=null,localStream=null,audioContext=null,processor=null,myId=null,conversationId=null,mode=null;
+let timerId=null,timerSeconds=0,activeCallId=null,demoTimers=[],lastProtocol=null,lastTranscript='',currentCallStarted=null,currentDetected=null,pendingDetectedEdit=null,lastLiveContract=null,liveAnalysisTimer=null,settings=loadSettings(),audioFinalizePromise=null,audioFinalizeResolve=null,audioFinalizeReject=null;
 const $=id=>document.getElementById(id);
 const els={status:$('status'),dot:$('statusDot'),log:$('log'),caller:$('callerBtn'),listener:$('listenerBtn'),demo:$('demoBtn'),stop:$('stopBtn'),timer:$('timer'),callState:$('callState'),callHint:$('callHint'),badge:$('callBadge'),stt:$('sttState'),ai:$('aiState'),found:$('foundState'),transcript:$('transcript'),protocol:$('protocol'),count:$('agreementCount'),list:$('agreementList'),empty:$('emptyAgreements'),modal:$('modal')};
 const labels={high:'Высокий',medium:'Средний',low:'Низкий',pending:'В работе',done:'Выполнено',cancelled:'Отменено'};
@@ -20,32 +20,99 @@ function getData(){return read(STORAGE_KEY,[])}
 function getCalls(){return read(CALLS_KEY,[])}
 function loadSettings(){return {...{autoCreateTasks:true,autoCreateCalendar:true,askConfirmation:true,autoPriority:true,triggerPhrases:['отправлю','подготовлю','согласуем','встречаемся','пришлю']},...read(SETTINGS_KEY,{})}}
 function saveSettingsLocal(v){settings=v;write(SETTINGS_KEY,v)}
-function normalizeAgreement(a={},i=0){let contractId=String(a.contractId||a.contract_id||'').trim();let detectedName=String(a.contractName||a.contract_name||'').trim();if(!contractId&&detectedName){const m=detectedName.match(/(?:договор|сделка)\s*(?:№|N|#)?\s*(\d[\d-]*)/i);if(m)contractId=m[1]}if(!detectedName&&contractId)detectedName=`Договор №${contractId}`;const contractName=detectedName||'Договор без номера';return{id:a.id||uid('agr'),contractName,client:a.client||a.clientName||'Клиент',text:a.text||a.agreement||a.agreement_text||'',owner:a.owner||'Менеджер',deadline:a.deadline||'',priority:a.priority||'medium',status:a.status||'pending',details:a.details||'',callId:a.callId||a.call_id||activeCallId||'',contractId,createdAt:a.createdAt||new Date().toISOString(),updatedAt:a.updatedAt||new Date().toISOString()}}
+function normalizeAgreement(a={},i=0){let contractId=String(a.contractId??a.contract_id??'').trim();let detectedName=String(a.contractName??a.contract_name??'').trim();if(!contractId&&detectedName){const m=detectedName.match(/(?:договор|сделка)\s*(?:№|N|#)?\s*(\d[\d-]*)/i);if(m)contractId=m[1]}if(contractId&&!/^\d[\d-]*$/.test(contractId))contractId='';if(contractId)detectedName=detectedName.replace(/^договор\s*(?:№|N|#)?\s*$/i,'').trim()||`Договор №${contractId}`;const contractName=detectedName||'Договорённость';return{id:a.id||uid('agr'),contractName,client:a.client||a.clientName||'Клиент',text:a.text||a.agreement||a.agreement_text||'',owner:a.owner||'Менеджер',deadline:a.deadline||'',priority:a.priority||'medium',status:a.status||'pending',details:a.details||'',callId:a.callId||a.call_id||activeCallId||'',contractId,createdAt:a.createdAt||new Date().toISOString(),updatedAt:a.updatedAt||new Date().toISOString()}}
 function saveData(data, sync=true){write(STORAGE_KEY,data);renderAgreements();if(sync)data.forEach(x=>apiSync(x))}
 async function api(path,opts={}){if(!API_BASE)throw new Error('API недоступен');const r=await fetch(API_BASE+path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});if(!r.ok)throw new Error(`${r.status} ${await r.text()}`);return r.status===204?null:r.json()}
 async function apiSync(item){try{await api('/protocol/agreement',{method:'POST',body:JSON.stringify(item)})}catch(e){log('API sync: '+e.message)}}
 function extractContractRef(text=''){const m=String(text).match(/(?:договор(?:а|у|ом)?|сделк(?:а|и|у|ой))\s*(?:№|N|#)?\s*([A-Za-zА-Яа-я0-9][\w-]*)/i);return m?String(m[1]):''}
-function protocolToAgreements(data){const result=[],contracts=Array.isArray(data.contracts)?data.contracts:[];contracts.forEach(c=>{const rawName=c.contract_name||c.contractName||'';const rawId=String(c.contract_id||c.contractId||extractContractRef(rawName)).trim();const contractName=rawName|| (rawId?`Договор №${rawId}`:'Договор без номера');(c.agreements||[]).forEach((a,i)=>{const task=(c.tasks||[])[i]||{};result.push(normalizeAgreement({contractName,contractId:rawId,text:typeof a==='string'?a:a.text,details:c.details,owner:task.owner,deadline:task.deadline,priority:task.priority||'medium'},result.length))})});if(!contracts.length)(data.agreements||[]).forEach((a,i)=>{const task=(data.tasks||[])[i]||{};const text=typeof a==='string'?a:a.text||'';const rawName=task.contract_name||task.contractName||'';const rawId=String(task.contract_id||task.contractId||extractContractRef(rawName)||extractContractRef(text)).trim();result.push(normalizeAgreement({contractName:rawName||(rawId?`Договор №${rawId}`:'Договор без номера'),contractId:rawId,text,owner:task.owner,deadline:task.deadline,priority:task.priority},i))});return result}
-function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active-page'));$(id).classList.add('active-page');document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.page===id));if(id==='agreementsPage')renderAgreements()}
+function protocolToAgreements(data){
+  const result=[];
+  const contracts=Array.isArray(data.contracts)?data.contracts:[];
+  contracts.forEach(c=>{
+    const rawName=c.contract_name||c.contractName||'';
+    const rawId=String(c.contract_id||c.contractId||extractContractRef(rawName)).trim();
+    const contractName=rawName||'Договорённость';
+    const agreements=Array.isArray(c.agreements)?c.agreements:[];
+    const tasks=Array.isArray(c.tasks)?c.tasks:[];
+    agreements.forEach((a,i)=>{
+      const task=tasks[i]||{};
+      result.push(normalizeAgreement({contractName,contractId:rawId,text:typeof a==='string'?a:a.text,details:c.details,owner:task.owner,deadline:task.deadline||a.deadline,priority:task.priority||a.priority||'medium'},result.length));
+    });
+    if(!agreements.length){
+      tasks.forEach(t=>result.push(normalizeAgreement({contractName,contractId:rawId,text:t.task||'',details:c.details,owner:t.owner,deadline:t.deadline,priority:t.priority||'medium'},result.length)));
+    }
+  });
+  if(!contracts.length){
+    const agreements=Array.isArray(data.agreements)?data.agreements:[];
+    const tasks=Array.isArray(data.tasks)?data.tasks:[];
+    agreements.forEach((a,i)=>{
+      const task=tasks[i]||{};
+      const text=typeof a==='string'?a:a.text||'';
+      const rawName=task.contract_name||task.contractName||a.contract_name||a.contractName||'';
+      const rawId=String(task.contract_id||task.contractId||a.contract_id||a.contractId||extractContractRef(rawName)||extractContractRef(text)).trim();
+      result.push(normalizeAgreement({contractName:rawName||'Договорённость',contractId:rawId,text,owner:task.owner||a.owner,deadline:task.deadline||a.deadline,priority:task.priority||a.priority||'medium'},i));
+    });
+    if(!agreements.length){
+      tasks.forEach((task,i)=>{
+        const rawName=task.contract_name||task.contractName||'';
+        const rawId=String(task.contract_id||task.contractId||extractContractRef(rawName)||extractContractRef(task.task||'')).trim();
+        result.push(normalizeAgreement({contractName:rawName||'Договорённость',contractId:rawId,text:task.task||'',owner:task.owner,deadline:task.deadline,priority:task.priority||'medium'},i));
+      });
+    }
+  }
+  return result;
+}
+async function loadAgreementsFromApi(){
+  try{
+    const r=await api('/protocol/agreements/all');
+    const remote=Array.isArray(r?.agreements)?r.agreements.map(normalizeAgreement):[];
+    if(!remote.length){renderAgreements();return}
+    const local=getData();
+    const byId=new Map();
+    [...local,...remote].forEach(item=>{
+      const n=normalizeAgreement(item);
+      if(!n.id)return;
+      const prev=byId.get(n.id);
+      byId.set(n.id,prev?{...prev,...n}:n);
+    });
+    const merged=[...byId.values()];
+    write(STORAGE_KEY,merged);
+    renderAgreements();
+    log(`Список договорённостей синхронизирован: ${merged.length}`);
+  }catch(e){
+    renderAgreements();
+    log('Список договорённостей: API недоступно, показаны локальные данные');
+  }
+}
+async function switchPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active-page'));
+  $(id).classList.add('active-page');
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.page===id));
+  if(id==='agreementsPage'){
+    renderAgreements();
+    await loadAgreementsFromApi();
+  }
+}
 function isOverdue(a){return a.status==='pending'&&a.deadline&&new Date(a.deadline+'T23:59:59')<new Date()}
-function renderAgreements(){const all=getData();els.count.textContent=all.length;const q=($('searchInput')?.value||'').toLowerCase(),sf=$('statusFilter')?.value||'all',pf=$('priorityFilter')?.value||'all';const filtered=all.filter(a=>(sf==='all'||a.status===sf)&&(pf==='all'||a.priority===pf)&&(!q||[a.contractName,a.client,a.text,a.owner,a.details].join(' ').toLowerCase().includes(q)));$('totalStat').textContent=all.length;$('pendingStat').textContent=all.filter(a=>a.status==='pending').length;$('doneStat').textContent=all.filter(a=>a.status==='done').length;$('overdueStat').textContent=all.filter(isOverdue).length;const overdue=all.filter(isOverdue);const ns=$('notificationStrip');if(overdue.length){ns.hidden=false;ns.innerHTML=`⚠ <b>${overdue.length}</b> ${overdue.length===1?'договорённость требует':'договорённостей требуют'} внимания: есть просроченные сроки.`}else ns.hidden=true;els.list.innerHTML=filtered.map(a=>`<article class="agreement-card ${isOverdue(a)?'overdue':''}"><div class="agreement-main"><h3>${esc(a.contractName)}</h3><div class="client">${esc(a.client||'Клиент не указан')} · ${esc(a.owner)}</div><div class="agreement-text">${esc(a.text)}</div><div class="meta"><span class="pill ${a.priority}">${labels[a.priority]}</span><span class="pill ${a.status}">${labels[a.status]}</span>${a.deadline?`<span class="pill ${isOverdue(a)?'high':''}">Срок: ${esc(formatDate(a.deadline))}</span>`:''}${a.callId?`<span class="pill">Звонок: ${esc(a.callId.slice(-8))}</span>`:''}</div>${a.details?`<p class="client details">${esc(a.details)}</p>`:''}</div><div class="agreement-actions"><button class="icon-btn" onclick="editAgreement('${a.id}')">Изменить</button>${a.status==='pending'?`<button class="icon-btn" onclick="completeAgreement('${a.id}')">✓ Выполнить</button>`:''}<button class="icon-btn delete" onclick="deleteAgreement('${a.id}')">Удалить</button></div></article>`).join('');els.empty.hidden=filtered.length!==0;if(!filtered.length&&all.length)els.empty.hidden=true}
-function formatDate(d){const x=new Date(d);return isNaN(x)?d:x.toLocaleDateString('ru-RU')}
-function openModal(item=null){$('agreementForm').reset();$('editId').value=item?.id||'';$('modalTitle').textContent=item?'Изменить договорённость':'Новая договорённость';$('contractId').value=item?.contractId||extractContractRef(item?.contractName||'');$('contractName').value=item?.contractName||'';$('clientName').value=item?.client||'';$('agreementText').value=item?.text||'';$('owner').value=item?.owner||'Менеджер';$('deadline').value=item?.deadline||'';$('priority').value=item?.priority||'medium';$('agreementStatus').value=item?.status||'pending';$('details').value=item?.details||'';els.modal.hidden=false}
+function renderAgreements(){const all=getData();els.count.textContent=all.length;const q=($('searchInput')?.value||'').toLowerCase(),sf=$('statusFilter')?.value||'all',pf=$('priorityFilter')?.value||'all';const filtered=all.filter(a=>(sf==='all'||a.status===sf)&&(pf==='all'||a.priority===pf)&&(!q||[a.contractName,a.contractId,a.client,a.text,a.owner,a.details].join(' ').toLowerCase().includes(q)));$('totalStat').textContent=all.length;$('pendingStat').textContent=all.filter(a=>a.status==='pending').length;$('doneStat').textContent=all.filter(a=>a.status==='done').length;$('overdueStat').textContent=all.filter(isOverdue).length;const overdue=all.filter(isOverdue);const ns=$('notificationStrip');if(overdue.length){ns.hidden=false;ns.innerHTML=`⚠ <b>${overdue.length}</b> ${overdue.length===1?'договорённость требует':'договорённостей требуют'} внимания: есть просроченные сроки.`}else ns.hidden=true;els.list.innerHTML=filtered.map(a=>`<article class="agreement-card ${isOverdue(a)?'overdue':''}"><div class="agreement-main"><h3>${esc(a.contractName||'Договорённость')}</h3><div class="client">Номер договора: <b>${esc(a.contractId||'—')}</b> · ${esc(a.client||'Клиент не указан')} · ${esc(a.owner)}</div><div class="agreement-text">${esc(a.text)}</div><div class="meta"><span class="pill ${a.priority}">${labels[a.priority]}</span><span class="pill ${a.status}">${labels[a.status]}</span>${a.deadline?`<span class="pill ${isOverdue(a)?'high':''}">Срок: ${esc(formatDate(a.deadline))}</span>`:''}${a.callId?`<span class="pill">Звонок: ${esc(a.callId.slice(-8))}</span>`:''}</div>${a.details?`<p class="client details">${esc(a.details)}</p>`:''}</div><div class="agreement-actions"><button class="icon-btn" onclick="editAgreement('${a.id}')">Изменить</button>${a.status==='pending'?`<button class="icon-btn" onclick="completeAgreement('${a.id}')">✓ Выполнить</button>`:''}<button class="icon-btn delete" onclick="deleteAgreement('${a.id}')">Удалить</button></div></article>`).join('');els.empty.hidden=filtered.length!==0;if(!filtered.length&&all.length)els.empty.hidden=true}
+
+function openModal(item=null){$('agreementForm').reset();$('agreementForm').querySelector('button[type=submit]').textContent='Сохранить';$('editId').value=item?.id||'';$('modalTitle').textContent=item?'Изменить договорённость':'Новая договорённость';$('contractId').value=item?.contractId||extractContractRef(item?.contractName||'');$('contractName').value=item?.contractName||'';$('clientName').value=item?.client||'';$('agreementText').value=item?.text||'';$('owner').value=item?.owner||'Менеджер';$('deadline').value=item?.deadline||'';$('priority').value=item?.priority||'medium';$('agreementStatus').value=item?.status||'pending';$('details').value=item?.details||'';els.modal.hidden=false}
 function closeModal(){$('modal').hidden=true}
 window.editAgreement=id=>{const a=getData().find(x=>x.id===id);if(a)openModal(a)};
 window.completeAgreement=async id=>{const all=getData(),a=all.find(x=>x.id===id);if(!a)return;a.status='done';a.updatedAt=new Date().toISOString();write(STORAGE_KEY,all);renderAgreements();await apiSync(a);log(`Договорённость выполнена: ${a.text}`);toast('Договорённость отмечена как выполненная')};
 window.deleteAgreement=async id=>{const a=getData().find(x=>x.id===id);if(!a||!confirm(`Удалить договорённость «${a.text}»?`))return;write(STORAGE_KEY,getData().filter(x=>x.id!==id));renderAgreements();try{await api(`/protocol/agreement/${encodeURIComponent(id)}`,{method:'DELETE'})}catch{}log('Договорённость удалена')};
-$('agreementForm').addEventListener('submit',async e=>{e.preventDefault();const data=getData(),id=$('editId').value,contractId=$('contractId').value.trim(),contractName=$('contractName').value.trim()||(contractId?`Договор №${contractId}`:'Договор без номера');const item=normalizeAgreement({id:id||uid('agr'),contractName,contractId,client:$('clientName').value,text:$('agreementText').value,owner:$('owner').value,deadline:$('deadline').value,priority:$('priority').value,status:$('agreementStatus').value,details:$('details').value,callId:activeCallId});const next=id?data.map(x=>x.id===id?item:x):[item,...data];write(STORAGE_KEY,next);renderAgreements();closeModal();await apiSync(item);if(!id&&settings.autoCreateTasks)await createCRMTask(item);if(!id&&settings.autoCreateCalendar&&/встреч|созвон|звонок/i.test(item.text))await createCalendarEvent(item);log(id?'Договорённость изменена':'Новая договорённость сохранена');toast(id?'Договорённость изменена':'Договорённость сохранена')});
+$('agreementForm').addEventListener('submit',async e=>{e.preventDefault();const data=getData(),id=$('editId').value,contractId=$('contractId').value.trim(),contractName=$('contractName').value.trim()||(contractId?`Договор №${contractId}`:'Договорённость');const fromDetected=!!pendingDetectedEdit;const item=normalizeAgreement({...(fromDetected?pendingDetectedEdit:{}),id:id||uid('agr'),contractName,contractId,client:$('clientName').value,text:$('agreementText').value,owner:$('owner').value,deadline:$('deadline').value,priority:$('priority').value,status:$('agreementStatus').value,details:$('details').value,callId:activeCallId});closeModal();if(fromDetected){pendingDetectedEdit=null;currentDetected=[item];$('liveAgreementTitle').textContent='Обнаружена договорённость';$('liveAgreementText').textContent=`${item.contractName}: ${item.text}`;$('liveAgreementBox').hidden=false;log('AI: изменённая договорённость сохранена в окне подтверждения. Нажмите «Подтвердить», чтобы добавить её в список.');toast('Изменения сохранены. Теперь нажмите «Подтвердить»')}else{const next=id?data.map(x=>x.id===id?item:x):[item,...data];write(STORAGE_KEY,next);renderAgreements();try{await apiSync(item);await loadAgreementsFromApi()}catch(e){log('Синхронизация: '+e.message)}if(!id&&settings.autoCreateTasks)await createCRMTask(item);if(!id&&settings.autoCreateCalendar&&/встреч|созвон|звонок/i.test(item.text))await createCalendarEvent(item);log(id?'Договорённость изменена':'Новая договорённость сохранена');toast(id?'Договорённость изменена':'Договорённость сохранена')}});
+
 function renderProtocol(data){lastProtocol=data;const contracts=data.contracts?.length?data.contracts:[{contract_name:'Общий разговор',agreements:data.agreements||[],tasks:data.tasks||[]}];els.protocol.classList.remove('empty-state');els.protocol.innerHTML=contracts.map((c,i)=>`<div class="contract-preview"><h3>${esc(c.contract_name||`Договор №${i+1}`)}</h3>${(c.agreements||[]).map(a=>`<p>• ${esc(typeof a==='string'?a:a.text||'')}</p>`).join('')}${(c.tasks||[]).map(t=>`<span class="task-chip">${esc(t.owner||'—')}: ${esc(t.task||'—')}${t.deadline?' · '+esc(t.deadline):''}</span>`).join('')}</div>`).join('');els.found.textContent=`${protocolToAgreements(data).length} договорённостей`;const summary=data.summary||buildSummary(data);$('summary').textContent=summary}
 function buildSummary(data){const n=protocolToAgreements(data).length,c=data.contracts?.length||0;return `Обсуждены ${c||'несколько'} ${c===1?'договор':'договоров'}. Зафиксировано ${n} договорённост${n===1?'ь':'и'}. По результатам разговора сформированы задачи и сроки.`}
 function appendTranscript(text,who='Собеседник'){if(els.transcript.classList.contains('transcript-empty'))els.transcript.innerHTML='';const div=document.createElement('div');div.className='transcript-line';div.innerHTML=`<strong>${esc(who)}:</strong>${esc(text)}`;els.transcript.appendChild(div);els.transcript.scrollTop=els.transcript.scrollHeight;lastTranscript+=(lastTranscript?' ':'')+text}
 function startTimer(){clearInterval(timerId);timerSeconds=0;els.timer.textContent='00:00';timerId=setInterval(()=>{timerSeconds++;els.timer.textContent=`${String(Math.floor(timerSeconds/60)).padStart(2,'0')}:${String(timerSeconds%60).padStart(2,'0')}`},1000)}
 function stopTimer(){clearInterval(timerId);timerId=null}
 function setCallActive(active,label='Идёт звонок'){els.stop.disabled=!active;els.caller.disabled=active;els.listener.disabled=active;els.demo.disabled=active;els.badge.textContent=active?'Активен':'Не активен';els.badge.classList.toggle('active',active);els.callState.textContent=label;status(active?'Звонок активен':'Готов к работе',active)}
-async function startCall(selected){if(!$('consentBtn').dataset.accepted){alert('Сначала подтвердите уведомление о записи разговора.');return}mode=selected;activeCallId=uid('call');currentCallStarted=new Date();lastTranscript='';lastLiveContract=null;setCallActive(true,selected==='caller'?'Идёт реальный звонок':'Слушатель подключается');startTimer();els.stt.textContent='Запуск';els.ai.textContent='Ожидание';els.callHint.textContent=selected==='caller'?'Микрофон захватывается и отправляется в GigaAM. Демо-режим не включается автоматически.':'Режим слушателя: ожидается входящий аудиопоток.';try{try{await api(`/protocol/start?call_id=${encodeURIComponent(activeCallId)}`,{method:'POST'});log('Протокол звонка создан')}catch(e){log('API протокола недоступно, продолжаю локальную обработку: '+e.message)}if(!navigator.mediaDevices?.getUserMedia)throw new Error('Браузер не дал доступ к микрофону');localStream=await navigator.mediaDevices.getUserMedia({audio:selected==='caller',video:false});connectAudio();startAudioCapture();connectSignaling()}catch(e){log('Реальный звонок не запущен: '+e.message);status('Ошибка запуска',false);els.callState.textContent='Не удалось начать звонок';els.stt.textContent='Ошибка';els.ai.textContent='Не запущен';stopCall(false)}}
-function connectSignaling(){try{signalingWs=new WebSocket(SIGNALING_URL);signalingWs.onopen=()=>{log('Signaling подключён');status('Звонок активен',true)};signalingWs.onmessage=async e=>{const m=JSON.parse(e.data);if(m.type==='init'){myId=m.id;await createPeerConnection()}else if(m.type==='offer'){if(!pc)await createPeerConnection();await pc.setRemoteDescription(m.sdp);const a=await pc.createAnswer();await pc.setLocalDescription(a);signalingWs.send(JSON.stringify({type:'answer',sdp:pc.localDescription}))}else if(m.type==='answer'&&pc)await pc.setRemoteDescription(m.sdp);else if(m.type==='candidate'&&pc){try{await pc.addIceCandidate(m.candidate)}catch{}}};signalingWs.onerror=()=>log('Сигнализация недоступна: аудиораспознавание продолжит работать без второго WebRTC-клиента') }catch(e){log('Signaling недоступен: '+e.message)}}
+async function startCall(selected){if(!$('consentBtn').dataset.accepted){alert('Сначала подтвердите уведомление о записи разговора.');return}mode=selected;activeCallId=uid('call');currentCallStarted=new Date();lastTranscript='';lastLiveContract=null;setCallActive(true,selected==='caller'?'Идёт реальный звонок':'Слушатель подключается');startTimer();els.stt.textContent='Запуск';els.ai.textContent='Ожидание';els.callHint.textContent=selected==='caller'?'Микрофон захватывается и отправляется в GigaAM. Демо-режим не включается автоматически.':'Режим слушателя: ожидается входящий аудиопоток.';try{try{await api(`/protocol/start?call_id=${encodeURIComponent(activeCallId)}`,{method:'POST'});log('Протокол звонка создан')}catch(e){log('API протокола недоступно, продолжаю локальную обработку: '+e.message)}if(!navigator.mediaDevices?.getUserMedia)throw new Error('Браузер не дал доступ к микрофону');localStream=await navigator.mediaDevices.getUserMedia({audio:selected==='caller',video:false});await connectSignaling()}catch(e){log('Реальный звонок не запущен: '+e.message);status('Ошибка запуска',false);els.callState.textContent='Не удалось начать звонок';els.stt.textContent='Ошибка';els.ai.textContent='Не запущен';stopCall(false)}}
+function connectSignaling(){return new Promise((resolve,reject)=>{try{signalingWs=new WebSocket(SIGNALING_URL);signalingWs.onopen=()=>{log('Signaling подключён');status('Звонок активен',true)};signalingWs.onmessage=async e=>{const m=JSON.parse(e.data);if(m.type==='init'){myId=m.id;conversationId=m.conversation_id||conversationId||`call:${activeCallId}`;log(`Общий разговор: ${conversationId}`);connectAudio();startAudioCapture();await createPeerConnection();resolve(conversationId)}else if(m.type==='offer'){if(!pc)await createPeerConnection();await pc.setRemoteDescription(m.sdp);const a=await pc.createAnswer();await pc.setLocalDescription(a);signalingWs.send(JSON.stringify({type:'answer',sdp:pc.localDescription}))}else if(m.type==='answer'&&pc)await pc.setRemoteDescription(m.sdp);else if(m.type==='candidate'&&pc){try{await pc.addIceCandidate(m.candidate)}catch{}}};signalingWs.onerror=()=>{log('Сигнализация недоступна: аудиораспознавание продолжит работать без второго WebRTC-клиента');conversationId=conversationId||`call:${activeCallId}`;connectAudio();startAudioCapture();resolve(conversationId)};signalingWs.onclose=()=>{};}catch(e){log('Signaling недоступен: '+e.message);conversationId=conversationId||`call:${activeCallId}`;connectAudio();startAudioCapture();resolve(conversationId)}}) }
 async function createPeerConnection(){pc=new RTCPeerConnection(ICE_CONFIG);localStream?.getTracks().forEach(t=>pc.addTrack(t,localStream));pc.onicecandidate=e=>{if(e.candidate&&signalingWs?.readyState===1)signalingWs.send(JSON.stringify({type:'candidate',candidate:e.candidate}))};pc.onconnectionstatechange=()=>log('WebRTC: '+pc.connectionState);const offer=await pc.createOffer();await pc.setLocalDescription(offer);signalingWs.send(JSON.stringify({type:'offer',sdp:pc.localDescription}))}
-function connectAudio(){audioWs=new WebSocket(`${AUDIO_URL}?call_id=${activeCallId}`);audioWs.binaryType='arraybuffer';audioWs.onopen=()=>{els.stt.textContent='Работает';log('Аудио-канал подключён к текущему звонку')};audioWs.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='transcript'){appendTranscript(m.text);els.ai.textContent='Речь распознана'}else if(m.type==='final_protocol'){const data=parseJSON(m.content);if(data){lastProtocol=data;renderProtocol(data);els.ai.textContent='Готов';log(`AI: сервер прислал итоговый анализ (${protocolToAgreements(data).length} договорённостей)`);if(audioFinalizeResolve){audioFinalizeResolve(data);audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}}}else if(m.type==='final_protocol_error'){const err=new Error(m.message||'Не удалось выполнить итоговый анализ');if(audioFinalizeReject){audioFinalizeReject(err);audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}log('AI-анализ: '+err.message)}}catch(err){log('Ошибка ответа: '+err.message)}};audioWs.onerror=()=>{els.stt.textContent='Ошибка';log('Аудио WebSocket недоступен');if(audioFinalizeReject){audioFinalizeReject(new Error('Аудио-канал недоступен'));audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}};audioWs.onclose=()=>{if(audioFinalizeReject){audioFinalizeReject(new Error('Аудио-канал закрыт до получения анализа'));audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}}} 
+function connectAudio(){const q=new URLSearchParams({call_id:activeCallId,conversation_id:conversationId||`call:${activeCallId}`});audioWs=new WebSocket(`${AUDIO_URL}?${q.toString()}`);audioWs.binaryType='arraybuffer';audioWs.onopen=()=>{els.stt.textContent='Работает';log('Аудио-канал подключён к текущему звонку')};audioWs.onmessage=async e=>{try{const m=JSON.parse(e.data);if(m.type==='transcript'){appendTranscript(m.text);els.ai.textContent='Речь распознана'}else if(m.type==='final_protocol'){const data=parseJSON(m.content);if(data){lastProtocol=data;renderProtocol(data);await showAnalysisResult(data,m.shared_call_id||activeCallId);els.ai.textContent='Готов';log(`AI: сервер прислал итоговый анализ (${protocolToAgreements(data).length} договорённостей)`);if(audioFinalizeResolve){audioFinalizeResolve(data);audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}}}else if(m.type==='final_protocol_error'){const err=new Error(m.message||'Не удалось выполнить итоговый анализ');if(audioFinalizeReject){audioFinalizeReject(err);audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}log('AI-анализ: '+err.message)}}catch(err){log('Ошибка ответа: '+err.message)}};audioWs.onerror=()=>{els.stt.textContent='Ошибка';log('Аудио WebSocket недоступен');if(audioFinalizeReject){audioFinalizeReject(new Error('Аудио-канал недоступен'));audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}};audioWs.onclose=()=>{if(audioFinalizeReject){audioFinalizeReject(new Error('Аудио-канал закрыт до получения анализа'));audioFinalizeResolve=null;audioFinalizeReject=null;audioFinalizePromise=null;}}} 
 function requestFinalAnalysis(){if(!audioWs||audioWs.readyState!==WebSocket.OPEN)return Promise.reject(new Error('Аудио-канал уже закрыт'));if(audioFinalizePromise)return audioFinalizePromise;audioFinalizePromise=new Promise((resolve,reject)=>{audioFinalizeResolve=resolve;audioFinalizeReject=reject;});audioWs.send(JSON.stringify({type:'finalize'}));return Promise.race([audioFinalizePromise,new Promise((_,reject)=>setTimeout(()=>reject(new Error('Истекло время ожидания AI-анализа')),120000))]);}
 function startAudioCapture(){if(!localStream?.getAudioTracks?.().length){log('У этого режима нет исходящего микрофона');return}audioContext=new AudioContext({sampleRate:16000});const source=audioContext.createMediaStreamSource(localStream);processor=audioContext.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(audioWs?.readyState===1)audioWs.send(float32ToInt16(e.inputBuffer.getChannelData(0)))};source.connect(processor);processor.connect(audioContext.destination);audioContext.resume()}
 function float32ToInt16(a){const b=new Int16Array(a.length);for(let i=0;i<a.length;i++){const s=Math.max(-1,Math.min(1,a[i]));b[i]=s<0?s*32768:s*32767}return b.buffer}
@@ -54,26 +121,43 @@ function mergeUnique(items,existing){const keys=new Set(existing.map(x=>`${x.con
 function detectLiveAgreement(){/* В новой логике анализ показывается только после завершения звонка. */}
 
 async function saveDetected(){
-  if(!currentDetected)return false;
-  const pending=Array.isArray(currentDetected)?currentDetected:[currentDetected];
+  const pending=Array.isArray(currentDetected)?currentDetected.filter(Boolean):(currentDetected?[currentDetected]:[]);
+  if(!pending.length){toast('Нет договорённостей для подтверждения','error');log('AI: нажатие «Подтвердить», но текущий результат пуст');return false}
   let added=0;
+  const before=getData();
+  const addedItems=[];
   for(const detected of pending){
-    const item=normalizeAgreement({...detected,id:uid('agr'),callId:activeCallId});
-    const before=getData();
-    const next=mergeUnique([item],before);
-    if(next.length===before.length)continue;
-    write(STORAGE_KEY,next);renderAgreements();
-    await apiSync(item);
-    if(settings.autoCreateTasks)await createCRMTask(item);
-    if(settings.autoCreateCalendar&&/встреч|созвон|звонок/i.test(item.text))await createCalendarEvent(item);
-    added++;
+    const item=normalizeAgreement({...detected,id:uid('agr'),callId:detected.callId||activeCallId});
+    const exists=before.some(e=>((e.contractId&&item.contractId&&e.contractId===item.contractId)||(!e.contractId&&!item.contractId))&&String(e.text||'').trim()===String(item.text||'').trim());
+    if(exists)continue;
+    addedItems.push(item);added++;
   }
+  if(!addedItems.length){currentDetected=null;$('liveAgreementBox').hidden=true;toast('Все найденные договорённости уже сохранены','error');log('AI: подтверждение выполнено, но новых записей нет');return false}
+  write(STORAGE_KEY,[...addedItems,...before]);
+  renderAgreements();
   currentDetected=null;$('liveAgreementBox').hidden=true;
-  if(added){log(`Договорённости подтверждены: ${added}`);toast(added===1?'Договорённость подтверждена и сохранена':`Подтверждено договорённостей: ${added}`);}
-  else{toast('Все найденные договорённости уже сохранены','error');}
-  return added>0;
+  for(const item of addedItems){
+    try{await apiSync(item)}catch(e){log('Синхронизация договорённости: '+e.message)}
+    try{if(settings.autoCreateTasks)await createCRMTask(item)}catch(e){log('CRM после подтверждения: '+e.message)}
+    try{if(settings.autoCreateCalendar&&/встреч|созвон|звонок/i.test(item.text))await createCalendarEvent(item)}catch(e){log('Календарь после подтверждения: '+e.message)}
+  }
+  await loadAgreementsFromApi();
+  log(`Договорённости подтверждены и сохранены: ${added}`);
+  toast(added===1?'Договорённость подтверждена и сохранена':`Подтверждено договорённостей: ${added}`);
+  return true;
 }
-function editDetected(){if(!currentDetected)return;const first=Array.isArray(currentDetected)?currentDetected[0]:currentDetected;openModal(normalizeAgreement({...first,id:''}));currentDetected=null;$('liveAgreementBox').hidden=true}
+function editDetected(){
+  if(!currentDetected){toast('Нет результата AI для редактирования','error');return}
+  const list=Array.isArray(currentDetected)?currentDetected:[currentDetected];
+  const first=normalizeAgreement({...list[0],id:'',callId:activeCallId});
+  pendingDetectedEdit=first;
+  currentDetected=list.slice(1);
+  $('liveAgreementBox').hidden=true;
+  openModal(first);
+  $('modalTitle').textContent='Изменить и добавить договорённость';
+  $('agreementForm').querySelector('button[type=submit]').textContent='Сохранить и добавить';
+  log('AI: договорённость открыта для редактирования. После сохранения она будет добавлена в список договорённостей.');
+}
 async function showAnalysisResult(protocol, callId){
   lastProtocol=protocol;
   renderProtocol(protocol);
@@ -107,7 +191,7 @@ async function stopCall(save=true){
   try{await audioContext?.close()}catch{}
   audioContext=null;
   pc?.close();pc=null;
-  signalingWs?.close();signalingWs=null;
+  signalingWs?.close();signalingWs=null;conversationId=null;
   localStream?.getTracks()?.forEach(t=>t.stop());localStream=null;
   stopTimer();setCallActive(false,'Готов к звонку');els.timer.textContent='00:00';els.callHint.textContent='Звонок завершён. Выполняется итоговый анализ разговора.';
   let finalProtocol=null;

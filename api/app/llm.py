@@ -4,6 +4,7 @@
 """
 import json
 import re
+from datetime import date, datetime, timedelta
 import ollama
 
 MODEL = "qwen3:8b"
@@ -27,6 +28,7 @@ SYSTEM_PROMPT = r'''Ты — строгий AI-аналитик деловых �
 2. Явное поручение другому участнику: «пришлите счёт», «подтвердите количество», если поручение относится к деловой ситуации.
 3. Подтверждённое совместное решение: «договорились отправить КП в пятницу», «подтверждаю встречу с клиентом во вторник».
 4. Конкретная деловая встреча/звонок/поставка/оплата, если она действительно согласована, а не только предложена.
+5. Деловая встреча или действие, которое уже было назначено ранее и в разговоре подтверждается: «встреча назначена на 11 октября», «я планирую встретиться... — да, я готов». Если собеседник принимает участие/подтверждает готовность, это договорённость даже без номера договора.
 
 ЧТО НЕ СЧИТАТЬ ДОГОВОРЁННОСТЬЮ:
 - приветствия, прощания, благодарности, бытовой разговор;
@@ -53,13 +55,25 @@ E) можно указать точную цитату evidence из транс�
 Не достраивай смысл по одному искажённому слову. Не превращай похожие по звучанию слова в обязательства.
 Если фраза непонятна — пропусти её.
 
-ДОГОВОРЫ:
+ДОГОВОРЫ — НОМЕР НЕ ОБЯЗАТЕЛЕН:
+- Отсутствие номера договора НИКОГДА не является причиной пропускать реальную договорённость.
 - contract_id указывай только если номер договора явно назван в транскрипте.
 - Если номер произнесён словами, например «триста двадцать один», обязательно преобразуй его в цифры: «321».
 - contract_name указывай только если название явно названо.
 - Не наследуй номер договора на новую договорённость, если он не относится к ней явно.
 - Никогда не придумывай номер договора.
 - Если номер не назван, contract_id должен быть пустым, contract_name — «Договор без номера».
+- ВАЖНО: «Договор без номера» — это нормальная категория результата, а НЕ причина вернуть пустые contracts/agreements/tasks.
+- Пример: «обсудить нашу договорённость, назначенную на 11.10.2026, обсудить разработку мобильного приложения, вы готовы? — готов» — это подтверждённая деловая договорённость даже без номера договора.
+
+СРОКИ И ДАТЫ — КРИТИЧЕСКИ ВАЖНО:
+- Если в разговоре названа дата/время проведения согласованного действия, встречи, звонка, лекции, поставки, отправки или другого обязательства — обязательно запиши её в поле deadline соответствующей task.
+- Это относится не только к словам «срок», «дедлайн», «до», но и к самой дате события: «встретимся 28 октября», «лекция двадцать восьмого числа десятого месяца 2026 года», «завтра в десять часов».
+- Если дата выражена словами, преобразуй её в ISO-дату YYYY-MM-DD. Например: «двадцать восьмого числа десятого месяца две тысячи двадцать шестого года» → «2026-10-28».
+- Если указано относительное время («завтра», «послезавтра», «в пятницу», «во вторник»), рассчитай конкретную дату относительно текущей даты, указанной в сообщении пользователя. Не придумывай дату, если относительная формулировка неоднозначна.
+- Если указано время суток, сохрани его после даты в формате YYYY-MM-DD HH:MM.
+- Если дата есть в транскрипте, но Qwen не уверен в формулировке, всё равно укажи её только если она однозначно относится к конкретной договорённости.
+- Не оставляй deadline=null, если из evidence или контекста той же договорённости однозначно следует дата проведения/исполнения.
 
 ДОКАЗАТЕЛЬСТВО:
 Для каждой договорённости и задачи укажи evidence — точную непрерывную цитату из исходного транскрипта, на которой основан вывод. Не перефразируй evidence.
@@ -194,6 +208,186 @@ def _contract_id_from_text(text):
         if value is not None: return str(value)
     return ''
 
+
+# ---------- Даты и сроки ----------
+_CARDINAL_BY_ORDINAL = {
+    'первого':'один','первое':'один','первый':'один','первому':'один','первым':'один',
+    'второго':'два','второе':'два','второй':'два','второму':'два','вторым':'два',
+    'третьего':'три','третье':'три','третий':'три','третьему':'три','третьим':'три',
+    'четвёртого':'четыре','четвертого':'четыре','четвёртое':'четыре','четвертое':'четыре','четвёртый':'четыре','четвертый':'четыре',
+    'пятого':'пять','пятое':'пять','пятый':'пять','пятому':'пять','пятым':'пять',
+    'шестого':'шесть','шестое':'шесть','шестой':'шесть','шестому':'шесть','шестым':'шесть',
+    'седьмого':'семь','седьмое':'семь','седьмой':'семь','седьмому':'семь','седьмым':'семь',
+    'восьмого':'восемь','восьмое':'восемь','восьмой':'восемь','восьмому':'восемь','восьмым':'восемь',
+    'девятого':'девять','девятое':'девять','девятый':'девять','девятому':'девять','девятым':'девять',
+    'десятого':'десять','десятое':'десять','десятый':'десять','десятому':'десять','десятым':'десять',
+    'одиннадцатого':'одиннадцать','одиннадцатое':'одиннадцать','одиннадцатый':'одиннадцать',
+    'двенадцатого':'двенадцать','двенадцатое':'двенадцать','двенадцатый':'двенадцать',
+    'тринадцатого':'тринадцать','тринадцатое':'тринадцать','тринадцатый':'тринадцать',
+    'четырнадцатого':'четырнадцать','четырнадцатое':'четырнадцать','четырнадцатый':'четырнадцать',
+    'пятнадцатого':'пятнадцать','пятнадцатое':'пятнадцать','пятнадцатый':'пятнадцать',
+    'шестнадцатого':'шестнадцать','шестнадцатое':'шестнадцать','шестнадцатый':'шестнадцать',
+    'семнадцатого':'семнадцать','семнадцатое':'семнадцать','семнадцатый':'семнадцать',
+    'восемнадцатого':'восемнадцать','восемнадцатое':'восемнадцать','восемнадцатый':'восемнадцать',
+    'девятнадцатого':'девятнадцать','девятнадцатое':'девятнадцать','девятнадцатый':'девятнадцать',
+    'двадцатого':'двадцать','двадцатое':'двадцать','двадцатый':'двадцать',
+    'тридцатого':'тридцать','тридцатое':'тридцать','тридцатый':'тридцать',
+}
+_MONTHS = {
+    'января':1,'февраля':2,'марта':3,'апреля':4,'мая':5,'июня':6,
+    'июля':7,'августа':8,'сентября':9,'октября':10,'ноября':11,'декабря':12,
+}
+_WEEKDAYS = {'понедельник':0,'вторник':1,'среду':2,'среда':2,'четверг':3,'пятницу':4,'пятница':4,'субботу':5,'суббота':5,'воскресенье':6,'воскресенья':6}
+
+def _normalize_num_token(token):
+    token=token.lower().strip(' ,.')
+    return _CARDINAL_BY_ORDINAL.get(token, token)
+
+def _ru_number_words_to_int_flexible(words):
+    normalized=' '.join(_normalize_num_token(w) for w in re.sub(r'[^а-яё -]',' ',str(words).lower()).split())
+    return _ru_number_words_to_int(normalized)
+
+def _ru_year_to_int(words):
+    words=re.sub(r'\bгода?\b',' ',str(words).lower())
+    # «две тысячи двадцать шестого» / «две тысячи двадцать шестого года».
+    m=re.search(r'((?:одна|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\s+тысяч[аиу]?\s+[а-яё -]+)', words)
+    if m:
+        part=m.group(1)
+        mt=re.search(r'\bтысяч[аиу]?\b',part)
+        before=part[:mt.start()].strip()
+        after=part[mt.end():].strip()
+        a=_ru_number_words_to_int_flexible(before)
+        b=_ru_number_words_to_int_flexible(after)
+        if a is not None and b is not None:
+            return a*1000+b
+    m=re.search(r'\b(20\d{2}|19\d{2}|[12]\d{3})\b', words)
+    if m: return int(m.group(1))
+    return _ru_number_words_to_int_flexible(words)
+
+def _parse_time(text):
+    t=str(text).lower()
+    m=re.search(r'\b(?:в|к|около)\s*(\d{1,2})(?::|\.)?(\d{2})?\s*(?:час(?:а|ов)?|ч)?\s*(утра|дня|вечера|ночи)?',t)
+    if m:
+        hour=int(m.group(1)); minute=int(m.group(2) or 0); part=m.group(3) or ''
+        if part in ('вечера','ночи') and hour<12: hour+=12
+        if part=='дня' and 1<=hour<12: hour+=12
+        if 0<=hour<=23 and 0<=minute<=59:return f'{hour:02d}:{minute:02d}'
+    m=re.search(r'\b(?:в|к)\s+([а-яё -]+?)\s+час(?:а|ов)?',t)
+    if m:
+        hour=_ru_number_words_to_int_flexible(m.group(1))
+        if hour is not None and 0<=hour<=23:return f'{hour:02d}:00'
+    return ''
+
+def _safe_iso(y,m,d):
+    try:return date(int(y),int(m),int(d)).isoformat()
+    except (TypeError,ValueError):return ''
+
+def _extract_date_candidates(text, reference_date=None):
+    text=str(text or '')
+    ref=reference_date or date.today()
+    out=[]
+    def add(ds,start,end,source):
+        if not ds:return
+        tm=_parse_time(text[max(0,start-25):min(len(text),end+45)])
+        value=ds + (f' {tm}' if tm else '')
+        if not any(x['date']==ds and abs(x['start']-start)<8 for x in out):out.append({'date':ds,'value':value,'start':start,'end':end,'source':source})
+    # 28.10.2026 / 28-10-2026 / 28/10/2026
+    for m in re.finditer(r'\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b',text): add(_safe_iso(m.group(3),m.group(2),m.group(1)),m.start(),m.end(),m.group(0))
+    # 28 октября 2026 года
+    month_alt='|'.join(_MONTHS)
+    for m in re.finditer(rf'\b(\d{{1,2}})\s+({month_alt})(?:\s+(\d{{4}}))?(?:\s*г(?:ода|\.)?)?',text.lower()):
+        y=int(m.group(3)) if m.group(3) else ref.year
+        add(_safe_iso(y,_MONTHS[m.group(2)],m.group(1)),m.start(),m.end(),m.group(0))
+    # «пятнадцатого одиннадцатого две тысячи двадцать седьмого года»
+    # Частая форма после ASR: день и месяц произнесены числительными без слов «числа/месяца».
+    numeric_words = r'([а-яё]+(?:\s+[а-яё]+){0,2})\s+([а-яё]+)(?:\s+([а-яё]+(?:\s+[а-яё]+){0,5}))?\s+года?'
+    for m in re.finditer(r'\b'+numeric_words, text.lower()):
+        day=_ru_number_words_to_int_flexible(m.group(1)); month=_ru_number_words_to_int_flexible(m.group(2)); year=_ru_year_to_int(m.group(3) or '')
+        if day and 1 <= day <= 31 and month and 1 <= month <= 12 and year and 1900 <= year <= 2200:
+            add(_safe_iso(year,month,day),m.start(),m.end(),m.group(0))
+
+    # «двадцать восьмого числа десятого месяца две тысячи двадцать шестого года»
+    pat=r'\b([а-яё]+(?:\s+[а-яё]+){0,1})\s+числа\s+([а-яё]+)\s+месяца\s+([а-яё]+(?:\s+[а-яё]+){0,4})(?:\s+года)?'
+    for m in re.finditer(pat,text.lower()):
+        day=_ru_number_words_to_int_flexible(m.group(1)); month=_ru_number_words_to_int_flexible(m.group(2)); year=_ru_year_to_int(m.group(3))
+        if day and month and year:
+            add(_safe_iso(year,month,day),m.start(),m.end(),m.group(0))
+    # «двадцать восьмого октября две тысячи двадцать шестого года»
+    for m in re.finditer(rf'\b([а-яё]+(?:\s+[а-яё]+){{0,2}})\s+({month_alt})(?:\s+([а-яё]+(?:\s+[а-яё]+){{0,5}}))?(?:\s+года)?',text.lower()):
+        day=_ru_number_words_to_int_flexible(m.group(1)); month=_MONTHS[m.group(2)]; year=_ru_year_to_int(m.group(3) or '')
+        if day and year:add(_safe_iso(year,month,day),m.start(),m.end(),m.group(0))
+    # Relative dates.
+    for m in re.finditer(r'\b(сегодня|завтра|послезавтра)\b',text.lower()):
+        delta={'сегодня':0,'завтра':1,'послезавтра':2}[m.group(1)]
+        add((ref+timedelta(days=delta)).isoformat(),m.start(),m.end(),m.group(1))
+    for m in re.finditer(r'\b(понедельник|вторник|среду|среда|четверг|пятницу|пятница|субботу|суббота|воскресенье|воскресенья)\b',text.lower()):
+        wd=_WEEKDAYS[m.group(1)]; delta=(wd-ref.weekday())%7
+        if delta==0: delta=7
+        add((ref+timedelta(days=delta)).isoformat(),m.start(),m.end(),m.group(1))
+    return sorted(out,key=lambda x:x['start'])
+
+def _normalize_deadline(value, reference_date=None):
+    if not value:return ''
+    candidates=_extract_date_candidates(str(value),reference_date)
+    if candidates:return candidates[0]['value']
+    return str(value).strip()
+
+def _enrich_deadlines(data, transcript):
+    """Заполняет deadline из фактических дат разговора, если Qwen оставил его null."""
+    ref=date.today()
+    candidates=_extract_date_candidates(transcript,ref)
+    def evidence_pos(item):
+        ev=str(item.get('evidence') or '')
+        if ev:
+            p=transcript.lower().find(ev.lower())
+            if p>=0:return p
+        txt=str(item.get('task') or item.get('text') or '')
+        p=transcript.lower().find(txt.lower()) if txt else -1
+        return p
+    def best_for(item, local_candidates=None):
+        # Дата из фактической цитаты разговора имеет приоритет над тем,
+        # что придумал/неверно распознал LLM. Это критично для форм
+        # «восемнадцатого одиннадцатого две тысячи двадцать седьмого года».
+        ev=str(item.get('evidence') or '')
+        txt=str(item.get('task') or item.get('text') or '')
+        local=_extract_date_candidates(ev,ref)
+        if local:
+            return local[0]['value']
+        local=_extract_date_candidates(ev+' '+txt,ref)
+        if local:
+            return local[0]['value']
+        # Если у LLM уже есть дата, нормализуем её, но не даём ей
+        # перекрыть явно найденную дату в evidence.
+        current=_normalize_deadline(item.get('deadline'),ref)
+        if current:return current
+        pool=local_candidates or candidates
+        if len(pool)==1:return pool[0]['value']
+        pos=evidence_pos(item)
+        if pos>=0 and pool:
+            return min(pool,key=lambda x:abs(x['start']-pos))['value']
+        return ''
+    for key in ('tasks','agreements'):
+        for item in data.get(key) or []:
+            if isinstance(item,dict):
+                dl=best_for(item)
+                if dl:item['deadline']=dl
+    for c in data.get('contracts') or []:
+        if not isinstance(c,dict):continue
+        local_text=' '.join(str(x.get('evidence') or x.get('text') or x.get('task') or '') for x in (c.get('agreements') or [])+(c.get('tasks') or []))
+        local_candidates=_extract_date_candidates(local_text,ref) or candidates
+        for item in c.get('tasks') or []:
+            if isinstance(item,dict):
+                dl=best_for(item,local_candidates)
+                if dl:item['deadline']=dl
+        for idx,item in enumerate(c.get('agreements') or []):
+            if isinstance(item,dict):
+                dl=best_for(item,local_candidates)
+                if not dl and idx < len(c.get('tasks') or []):
+                    task=c.get('tasks')[idx]
+                    if isinstance(task,dict):dl=task.get('deadline') or ''
+                if dl:item['deadline']=dl
+    return data
+
 def _apply_contract_ids(data, transcript):
     def item_id(item):
         if not isinstance(item,dict): return ''
@@ -216,13 +410,37 @@ def _apply_contract_ids(data, transcript):
                 if cid: item['contract_id']=cid; item['contract_name']=f'Договор №{cid}'
     return data
 
+def _business_retry_prompt(transcript_text: str) -> str:
+    return f"""Ты — второй, более внимательный проверяющий деловых договорённостей.
+
+Верни строго JSON того же формата, что требуется основному анализатору.
+Главное правило: НОМЕР ДОГОВОРА НЕ ОБЯЗАТЕЛЕН. Если в разговоре есть реальная деловая договорённость, создай её даже при contract_id=\"\" и contract_name=\"Договор без номера\".
+
+Особенно внимательно ищи:
+- уже назначенные деловые встречи/мероприятия;
+- даты проведения, сроки и время;
+- подтверждение готовности: «готов», «я готов», «согласен», «подтверждаю», «договорились»;
+- конкретное деловое действие, которое следует из контекста разговора.
+
+Не создавай запись для бытовых разговоров и предложений без принятия.
+Evidence обязано быть непрерывной точной цитатой из транскрипта.
+Confidence ставь не ниже 0.90 только для действительно подтверждённых случаев.
+
+Пример:
+Транскрипт: «обговорить нашу договоренность которая есть которая назначена на одиннадцатое десятое две тысячи двадцать шестого года ... обсудить разработку мобильного приложения для МТС ... вы готовы ... готов»
+Результат: одна договорённость без номера договора, с deadline=2026-10-11, связанная с встречей/обсуждением разработки мобильного приложения.
+
+Текущий транскрипт:
+{transcript_text}
+"""
+
 def extract_protocol(transcript_text: str) -> dict:
     print(f"[LLM] Отправка в {MODEL}...")
     response = ollama.chat(
         model=MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Исходный транскрипт разговора. Анализируй только этот текст:\n\n{transcript_text}"}
+            {"role": "user", "content": f"Текущая дата сервера: {date.today().isoformat()}. Используй её только для расчёта относительных дат вроде «завтра» или «во вторник».\n\nИсходный транскрипт разговора. Анализируй только этот текст:\n\n{transcript_text}"}
         ],
         think=False,
         options={"temperature": 0.1, "num_ctx": 8192}
@@ -280,6 +498,55 @@ def extract_protocol(transcript_text: str) -> dict:
                 "tasks": c_tasks,
             })
 
+    # Если основной Qwen слишком строго отфильтровал разговор, но в тексте явно
+    # есть деловые сигналы, делаем один повторный анализ с акцентом на то, что
+    # номер договора необязателен. Это защищает сценарий «Договор без номера».
+    total_found = len(agreements) + len(tasks) + sum(len(c.get("agreements") or []) + len(c.get("tasks") or []) for c in contracts)
+    business_markers = re.search(
+        r"\b(договорённост|договоренност|встреч|совещан|лекци|разработк|проект|приложен|клиент|заказ|поставк|согласен|готов|подтверждаю|договорились)\w*\b",
+        transcript_text.lower(),
+    )
+    if total_found == 0 and business_markers:
+        try:
+            retry = ollama.chat(
+                model=MODEL,
+                messages=[{"role": "user", "content": _business_retry_prompt(transcript_text)}],
+                think=False,
+                options={"temperature": 0.0, "num_ctx": 8192},
+            )
+            retry_raw = retry["message"]["content"]
+            retry_parsed = json.loads(clean_json(retry_raw))
+            retry_agreements = []
+            for a in retry_parsed.get("agreements") or []:
+                item = _valid_item(a, transcript_text)
+                if item: retry_agreements.append(item)
+            retry_tasks = []
+            for t in retry_parsed.get("tasks") or []:
+                item = _valid_task(t, transcript_text)
+                if item: retry_tasks.append(item)
+            retry_contracts = []
+            for c in retry_parsed.get("contracts") or []:
+                if not isinstance(c, dict): continue
+                ca = []
+                for a in c.get("agreements") or []:
+                    item = _valid_item(a, transcript_text)
+                    if item: ca.append(item)
+                ct = []
+                for t in c.get("tasks") or []:
+                    item = _valid_task(t, transcript_text)
+                    if item: ct.append(item)
+                if ca or ct:
+                    retry_contracts.append({
+                        "contract_id": str(c.get("contract_id") or "").strip(),
+                        "contract_name": str(c.get("contract_name") or "Договор без номера").strip(),
+                        "agreements": ca, "tasks": ct,
+                    })
+            if retry_agreements or retry_tasks or retry_contracts:
+                print("[LLM] Повторный анализ: найдены договорённости без обязательного номера договора")
+                agreements, tasks, contracts = retry_agreements, retry_tasks, retry_contracts
+        except Exception as e:
+            print(f"[LLM] Повторный анализ не выполнен: {e}")
+
     result = {
         "topic": parsed.get("topic") or None,
         "conversation_type": conversation_type,
@@ -289,7 +556,8 @@ def extract_protocol(transcript_text: str) -> dict:
         "contracts": contracts,
         "key_points": parsed.get("key_points") or [],
     }
-    return _apply_contract_ids(result, transcript_text)
+    result = _apply_contract_ids(result, transcript_text)
+    return _enrich_deadlines(result, transcript_text)
 
 
 def check_ollama_available() -> bool:
