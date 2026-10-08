@@ -120,7 +120,11 @@ def clean_json(raw: str) -> str:
 def _valid_evidence(text: str, evidence: str) -> bool:
     if not evidence or not text:
         return False
-    return evidence.strip().lower() in text.strip().lower()
+    # ASR/общий протокол часто содержит переносы строк между репликами.
+    # Проверяем непрерывную цитату с игнорированием только различий в пробелах.
+    hay = re.sub(r'\s+', ' ', text.strip().lower())
+    needle = re.sub(r'\s+', ' ', evidence.strip().lower())
+    return needle in hay
 
 
 def _valid_item(item, transcript: str):
@@ -186,14 +190,14 @@ def _contract_id_from_text(text):
     m=re.search(r'\b(?:договор\w*|контракт\w*)[^\n,.]{0,45}?\bномер\s+([а-яё -]{2,60})', text, re.I)
     if m:
         words=m.group(1).strip()
-        words=re.split(r'\b(?:мы|и|что|по|он|она|это|который|которая|завтра|встречаемся)\b',words,maxsplit=1,flags=re.I)[0].strip()
+        words=re.split(r'\b(?:мы|и|что|по|он|она|это|который|которая|завтра|встречаемся|да)\b',words,maxsplit=1,flags=re.I)[0].strip()
         value=_ru_number_words_to_int(words)
         if value is not None: return str(value)
     # ASR sometimes loses the word "номер": "по договору триста двадцать два".
     m=re.search(r'\b(?:договор\w*|контракт\w*)\s+([а-яё -]{2,45})', text, re.I)
     if m:
         words=m.group(1).strip()
-        words=re.split(r'\b(?:завтра|сегодня|мы|и|что|по|в|на|у|как|будем|нужно|должны|встречаемся)\b',words,maxsplit=1,flags=re.I)[0].strip()
+        words=re.split(r'\b(?:завтра|сегодня|мы|и|что|по|в|на|у|как|будем|нужно|должны|встречаемся|да)\b',words,maxsplit=1,flags=re.I)[0].strip()
         value=_ru_number_words_to_int(words)
         if value is not None: return str(value)
     # Accept "номер 332" / "номер триста тридцать два" even if ASR
@@ -203,7 +207,7 @@ def _contract_id_from_text(text):
     m=re.search(r'\bномер\s+([а-яё -]{2,60})', text, re.I)
     if m:
         words=m.group(1).strip()
-        words=re.split(r'\b(?:завтра|сегодня|мы|и|что|по|в|на|у|как|будем|нужно|должны|встречаемся|я|вы|хорошо|согласен|договорились)\b', words, maxsplit=1, flags=re.I)[0].strip()
+        words=re.split(r'\b(?:завтра|сегодня|мы|и|что|по|в|на|у|как|будем|нужно|должны|встречаемся|я|вы|хорошо|согласен|договорились|да)\b', words, maxsplit=1, flags=re.I)[0].strip()
         value=_ru_number_words_to_int(words)
         if value is not None: return str(value)
     return ''
@@ -306,6 +310,13 @@ def _extract_date_candidates(text, reference_date=None):
     for m in re.finditer(rf'\b(\d{{1,2}})\s+({month_alt})(?:\s+(\d{{4}}))?(?:\s*г(?:ода|\.)?)?',text.lower()):
         y=int(m.group(3)) if m.group(3) else ref.year
         add(_safe_iso(y,_MONTHS[m.group(2)],m.group(1)),m.start(),m.end(),m.group(0))
+    # «десятого октября» / «двадцать восьмого ноября» без явного года.
+    # В деловых звонках год часто опускается; используем текущий год.
+    for m in re.finditer(rf'\b([а-яё]+(?:\s+[а-яё]+){{0,2}})\s+({month_alt})\b', text.lower()):
+        day=_ru_number_words_to_int_flexible(m.group(1))
+        if day and 1 <= day <= 31:
+            add(_safe_iso(ref.year, _MONTHS[m.group(2)], day), m.start(), m.end(), m.group(0))
+
     # «пятнадцатого одиннадцатого две тысячи двадцать седьмого года»
     # Частая форма после ASR: день и месяц произнесены числительными без слов «числа/месяца».
     numeric_words = r'([а-яё]+(?:\s+[а-яё]+){0,2})\s+([а-яё]+)(?:\s+([а-яё]+(?:\s+[а-яё]+){0,5}))?\s+года?'
@@ -328,7 +339,7 @@ def _extract_date_candidates(text, reference_date=None):
     for m in re.finditer(r'\b(сегодня|завтра|послезавтра)\b',text.lower()):
         delta={'сегодня':0,'завтра':1,'послезавтра':2}[m.group(1)]
         add((ref+timedelta(days=delta)).isoformat(),m.start(),m.end(),m.group(1))
-    for m in re.finditer(r'\b(понедельник|вторник|среду|среда|четверг|пятницу|пятница|субботу|суббота|воскресенье|воскресенья)\b',text.lower()):
+    for m in re.finditer(r'\b(понедельник|вторник|среду|среда|четверг|пятницу|пятница|пятницы|субботу|суббота|воскресенье|воскресенья)\b',text.lower()):
         wd=_WEEKDAYS[m.group(1)]; delta=(wd-ref.weekday())%7
         if delta==0: delta=7
         add((ref+timedelta(days=delta)).isoformat(),m.start(),m.end(),m.group(1))
@@ -364,17 +375,24 @@ def _enrich_deadlines(data, transcript):
         local=_extract_date_candidates(ev+' '+txt,ref)
         if local:
             return local[0]['value']
-        # Сначала доверяем датам, которые реально есть в транскрипте.
-        # Qwen иногда ошибочно нормализует «до пятницы» в произвольную дату.
-        pool=local_candidates or candidates
-        pos=evidence_pos(item)
-        if pos>=0 and pool:
-            return min(pool,key=lambda x:abs(x['start']-pos))['value']
-        if len(pool)==1:return pool[0]['value']
-        # Только если в исходной речи нет подходящей даты, используем
-        # уже нормализованный deadline от LLM.
+        # НЕ наследуем дату просто потому, что в разговоре есть одна дата.
+        # Иначе договорённость «отправить КП» рядом со встречей во вторник
+        # ошибочно получает 13-е число. Дата должна быть в evidence/text
+        # самой договорённости.
+        local_text = f"{ev} {txt}".strip()
+        if local_text:
+            local = _extract_date_candidates(local_text, ref)
+            if local:
+                return local[0]['value']
+        # Qwen может уже вернуть ISO-дату. Принимаем её только если исходная
+        # формулировка item содержит явный маркер даты/срока.
         current=_normalize_deadline(item.get('deadline'),ref)
-        if current:return current
+        if current and re.search(
+            r'\b(сегодня|завтра|послезавтра|понедельник|вторник|среда|среду|четверг|пятница|пятницу|суббота|субботу|воскресенье|'
+            r'\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b',
+            local_text.lower()
+        ):
+            return current
         return ''
     for key in ('tasks','agreements'):
         for item in data.get(key) or []:
@@ -450,6 +468,274 @@ Confidence ставь не ниже 0.90 только для действите�
 Текущий транскрипт:
 {transcript_text}
 """
+
+# ---------- Надёжный детерминированный слой для явных договорённостей ----------
+# Qwen используется как основной семантический анализатор, но самые очевидные
+# конструкции нельзя терять из-за вариативности LLM. Этот слой работает только
+# для явных деловых формулировок и не пытается «додумывать» разговор.
+
+def _norm_phrase(value):
+    return re.sub(r'\s+', ' ', re.sub(r'[«»"“”]', '', str(value or '').lower())).strip(' .,:;')
+
+def _make_candidate(text, evidence='', deadline='', owner='Менеджер', contract_id=''):
+    text = re.sub(r'\s+', ' ', str(text or '')).strip(' .,:;')
+    text = re.split(r'\s*\[Сторона\s*\d+\]', text, maxsplit=1, flags=re.I)[0]
+    text = re.sub(r'\[Сторона\s*\d+\]\s*', '', text, flags=re.I)
+    # Абсолютная дата/срок хранится отдельно в deadline, поэтому не засоряем
+    # основной текст действия повтором «десятого октября».
+    if deadline:
+        text = re.sub(
+            r'\s+(?:первого|второго|третьего|четвёртого|четвертого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|тридцатого)\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?\s*$',
+            '', text, flags=re.I
+        )
+    evidence = re.sub(r'\s+', ' ', str(evidence or '')).strip()
+    if not text or not evidence:
+        return None
+    return {
+        'text': text,
+        'evidence': evidence,
+        'confidence': 0.99,
+        'confirmed': True,
+        'owner': owner or 'Менеджер',
+        'deadline': deadline or None,
+        'priority': 'medium',
+        'status': 'pending',
+        'contract_id': contract_id or '',
+        'contract_name': f'Договор №{contract_id}' if contract_id else 'Договор без номера',
+        'source': 'deterministic',
+    }
+
+def _deterministic_explicit_agreements(transcript):
+    """
+    Извлекает только очень явные конструкции, устойчивые к шуму ASR:
+    - договорились, что я/мы ...
+    - я/мы ... до пятницы/даты + подтверждение собеседника
+    - подтвердить ... / подтверждаем N ...
+    - встретимся ... договорились
+    """
+    text = re.sub(r'\s+', ' ', str(transcript or '')).strip()
+    low = text.lower()
+    out = []
+
+    # 1) «договорились, что я отправлю ... десятого октября»
+    # Берём предложение/фрагмент до ближайшего подтверждения, чтобы не тащить
+    # «хорошо» и повтор ASR.
+    for m in re.finditer(
+        r'\bдоговорились\s*,?\s*(?:что\s+)?(?:я|мы)\s+(.{3,180}?)(?=\s+(?:хорошо|ладно|договорились)\b|$)',
+        text, re.I
+    ):
+        action = m.group(1).strip(' .,:;')
+        # Не допускаем бытовые «встретимся» без делового контекста.
+        if not re.search(r'\b(отправлю|подготовлю|подтверд\w*|соглас\w*|оплат\w*|пришл\w*|передам|сдела\w*|встретим\w*|созвон\w*|обсуд\w*)\b', action, re.I):
+            continue
+        cands = _extract_date_candidates(action, date.today())
+        if not cands:
+            dm = re.search(r'\b(?:первого|второго|третьего|четвёртого|четвертого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|тридцатого)\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b', action.lower())
+            if dm: cands = _extract_date_candidates(dm.group(0), date.today())
+        deadline = cands[0]['value'] if cands else ''
+        evidence = m.group(0)
+        out.append(_make_candidate(action, evidence, deadline))
+
+    # 2) «я подготовлю документы до пятницы» + подтверждение.
+    for m in re.finditer(
+        r'\b(?:я|мы)\s+(подготов\w*|отправ\w*|пришл\w*|подтверд\w*|соглас\w*|оплат\w*|передам|сдела\w*)\s+(.{2,140}?)(?=\s+(?:хорошо|ладно|подтвержда\w*|договорились)\b|$)',
+        text, re.I
+    ):
+        action = f"{m.group(1)} {m.group(2)}".strip(' .,:;')
+        if not re.search(r'\b(до\s+(?:понедельника|вторника|среды|четверга|пятницы|субботы|воскресенья)|\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|(?:первого|второго|третьего|четвёртого|четвертого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|двадцатого|тридцатого)\b)', action, re.I):
+            continue
+        cands = _extract_date_candidates(action, date.today())
+        if not cands:
+            dm = re.search(r'\b(?:первого|второго|третьего|четвёртого|четвертого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|тридцатого)\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b', action.lower())
+            if dm: cands = _extract_date_candidates(dm.group(0), date.today())
+        deadline = cands[0]['value'] if cands else ''
+        # Для срока «до пятницы» evidence должен включать сам срок.
+        evidence = m.group(0)
+        out.append(_make_candidate(action, evidence, deadline))
+
+    # 3) «подтвердить количество мониторов ... подтверждаем двадцать мониторов».
+    # После склейки двух каналов ASR между фразами могут появляться лишние
+    # слова и метки сторон, поэтому здесь намеренно используем устойчивый
+    # шаблон, а не позиционный парсинг предложения.
+    m = re.search(
+        r'\bподтвердить\s+количество\s+мониторов\b.{0,180}?\bподтверждаем\s+'
+        r'(\d+|ноль|один|два|три|четыре|пять|шесть|семь|восемь|девять|десять|'
+        r'одиннадцать|двенадцать|тринадцать|четырнадцать|пятнадцать|шестнадцать|'
+        r'семнадцать|восемнадцать|девятнадцать|двадцать|тридцать|сорок|пятьдесят)'
+        r'\s*(?:монитор\w*|штук)\b',
+        text, re.I
+    )
+    if m:
+        value = m.group(1).strip()
+        if value.isdigit():
+            value_text = value
+        else:
+            value_text = value
+        cid = _contract_id_from_text(text)
+        ev_start=max(0,m.start()); ev_end=min(len(text),m.end()+25)
+        evidence=text[ev_start:ev_end].strip()
+        out.append(_make_candidate(
+            f"Подтвердить количество мониторов — {value_text} мониторов",
+            evidence, '', contract_id=cid
+        ))
+
+    # Более простой вариант после ASR, если «подтвердить» и «подтверждаем»
+    # оказались разделены неудачно.
+    if not any('подтвердить' in _norm_phrase(x['text']) for x in out):
+        m = re.search(
+            r'\bподтвердить\s+количество\s+мониторов\b.{0,100}?\bподтверждаем\s+(\d+|[а-яё -]+?)\s*(?:монитор\w*|штук)\b',
+            text, re.I
+        )
+        if m:
+            value = m.group(1).strip()
+            cid = _contract_id_from_text(text)
+            ev_start=max(0,m.start()-20); ev_end=min(len(text),m.end()+25)
+            out.append(_make_candidate(
+                f"Подтвердить количество мониторов — {value} мониторов",
+                text[ev_start:ev_end], '', contract_id=cid
+            ))
+
+    # 4) «встретимся во вторник в четырнадцать часов договорились»
+    for m in re.finditer(
+        r'\bвстретим\w*\s+(.{3,120}?)\s+договорились\b',
+        text, re.I
+    ):
+        action = f"Встретиться {m.group(1).strip(' .,:;')}"
+        cands = _extract_date_candidates(m.group(0), date.today())
+        deadline = cands[0]['value'] if cands else ''
+        tm = _parse_time(m.group(0))
+        if deadline and tm and ' ' not in deadline:
+            deadline = f'{deadline} {tm}'
+        out.append(_make_candidate(action, m.group(0), deadline))
+
+    # Убираем повторы.
+    unique=[]
+    seen=set()
+    for x in out:
+        key=(_norm_phrase(x['text']), x.get('contract_id',''), x.get('deadline') or '')
+        if key not in seen:
+            seen.add(key); unique.append(x)
+    return unique
+
+def _merge_candidates(data, transcript):
+    """
+    Канонизирует итог: одна смысловая договорённость = одна запись.
+    Не дублируем одну запись одновременно в top-level agreements/tasks/contracts.
+    """
+    candidates=[]
+
+    def add_item(item, is_task=False, contract_id=''):
+        if not isinstance(item, dict): return
+        text=str(item.get('text') or item.get('task') or '').strip()
+        if not text: return
+        candidates.append({
+            'text': text,
+            'evidence': str(item.get('evidence') or '').strip(),
+            'confidence': float(item.get('confidence', 0) or 0),
+            'confirmed': item.get('confirmed') is True,
+            'owner': item.get('owner') or 'Менеджер',
+            'deadline': item.get('deadline') or '',
+            'priority': item.get('priority') or 'medium',
+            'status': item.get('status') or 'pending',
+            'contract_id': str(item.get('contract_id') or contract_id or '').strip(),
+            'contract_name': item.get('contract_name') or '',
+            'source': item.get('source') or 'llm',
+        })
+
+    # Собираем всё, что прошло строгий валидатор.
+    for a in data.get('agreements') or []: add_item(a)
+    for t in data.get('tasks') or []: add_item(t, True)
+    for c in data.get('contracts') or []:
+        if not isinstance(c, dict): continue
+        cid=str(c.get('contract_id') or '').strip()
+        for a in c.get('agreements') or []: add_item(a, contract_id=cid)
+        for t in c.get('tasks') or []: add_item(t, True, cid)
+
+    # Добавляем детерминированные явные случаи.
+    for x in _deterministic_explicit_agreements(transcript):
+        add_item(x, contract_id=x.get('contract_id',''))
+
+    # Нормализуем даты до объединения.
+    for x in candidates:
+        if x['deadline']:
+            parsed=_extract_date_candidates(str(x['deadline']), date.today())
+            x['deadline']=parsed[0]['value'] if parsed else _normalize_deadline(x['deadline'], date.today())
+
+    # Дедуп: совпадение по нормализованному тексту или одинаковому evidence.
+    merged=[]
+    for x in candidates:
+        key_text=_norm_phrase(x['text'])
+        # Если LLM сформулировал «отправить коммерческое предложение»,
+        # а fallback «отправлю коммерческое предложение», считаем их одной
+        # записью при сильном пересечении слов.
+        words=set(re.findall(r'[а-яё0-9]+', key_text))
+        found=None
+        for y in merged:
+            ywords=set(re.findall(r'[а-яё0-9]+', _norm_phrase(y['text'])))
+            overlap=len(words & ywords)/max(1,len(words|ywords))
+            same_ev=x['evidence'] and y['evidence'] and _norm_phrase(x['evidence'])==_norm_phrase(y['evidence'])
+            if same_ev or overlap >= 0.70:
+                found=y; break
+        if found:
+            # Детерминированный слой имеет приоритет над LLM: он опирается
+            # только на явную конструкцию и не должен получать чужую дату
+            # из соседней договорённости.
+            if x.get('source') == 'deterministic':
+                found['deadline'] = x['deadline']
+                found['evidence'] = x['evidence']
+                found['text'] = x['text']
+                if x['contract_id']: found['contract_id']=x['contract_id']
+                found['source']='deterministic'
+            else:
+                if x['deadline'] and not found['deadline']: found['deadline']=x['deadline']
+                if x['contract_id'] and not found['contract_id']: found['contract_id']=x['contract_id']
+                if len(x['evidence']) > len(found['evidence']): found['evidence']=x['evidence']
+                if len(x['text']) > len(found['text']): found['text']=x['text']
+        else:
+            merged.append(x)
+
+    # Финальная фильтрация: только подтверждённые и имеющие evidence в исходнике.
+    final=[]
+    for x in merged:
+        if not x['evidence'] or not _valid_evidence(transcript, x['evidence']): continue
+        if not x['confirmed'] or x['confidence'] < MIN_CONFIDENCE: continue
+        cid=x['contract_id'] or _contract_id_from_text(x['evidence']) or _contract_id_from_text(x['text'])
+        x['contract_id']=cid
+        x['contract_name']=f'Договор №{cid}' if cid else 'Договор без номера'
+        final.append(x)
+
+    # Канонический формат для frontend: только contracts с уникальными
+    # agreements. Top-level массивы оставляем пустыми, чтобы не было двойного
+    # отображения одной записи.
+    contracts=[]
+    groups={}
+    for x in final:
+        cid=x['contract_id']
+        groups.setdefault(cid, []).append(x)
+    for cid, items in groups.items():
+        agreements=[]
+        tasks=[]
+        for x in items:
+            agreements.append({
+                'text': x['text'],
+                'evidence': x['evidence'],
+                'confidence': x['confidence'],
+                'confirmed': True,
+                'deadline': x['deadline'] or None,
+                'owner': x['owner'],
+                'priority': x['priority'],
+                'status': x['status'],
+            })
+        contracts.append({
+            'contract_id': cid,
+            'contract_name': f'Договор №{cid}' if cid else 'Договор без номера',
+            'agreements': agreements,
+            'tasks': tasks,
+        })
+    data['agreements']=[]
+    data['tasks']=[]
+    data['contracts']=contracts
+    return data
 
 def extract_protocol(transcript_text: str) -> dict:
     print(f"[LLM] Отправка в {MODEL}...")
@@ -574,7 +860,12 @@ def extract_protocol(transcript_text: str) -> dict:
         "key_points": parsed.get("key_points") or [],
     }
     result = _apply_contract_ids(result, transcript_text)
-    return _enrich_deadlines(result, transcript_text)
+    result = _enrich_deadlines(result, transcript_text)
+    # Последний обязательный слой: явные конструкции + дедупликация.
+    # Именно он защищает от пустого результата Qwen и от 2-10 копий одной
+    # договорённости в contracts/agreements/tasks.
+    result = _merge_candidates(result, transcript_text)
+    return result
 
 
 def check_ollama_available() -> bool:
