@@ -20,17 +20,17 @@ function getData(){return read(STORAGE_KEY,[])}
 function getCalls(){return read(CALLS_KEY,[])}
 function loadSettings(){return {...{autoCreateTasks:true,autoCreateCalendar:true,askConfirmation:true,autoPriority:true,triggerPhrases:['отправлю','подготовлю','согласуем','встречаемся','пришлю']},...read(SETTINGS_KEY,{})}}
 function saveSettingsLocal(v){settings=v;write(SETTINGS_KEY,v)}
-function normalizeAgreement(a={},i=0){let contractId=String(a.contractId??a.contract_id??'').trim();let detectedName=String(a.contractName??a.contract_name??'').trim();if(!contractId&&detectedName){const m=detectedName.match(/(?:договор|сделка)\s*(?:№|N|#)?\s*(\d[\d-]*)/i);if(m)contractId=m[1]}if(contractId&&!/^\d[\d-]*$/.test(contractId))contractId='';if(contractId)detectedName=detectedName.replace(/^договор\s*(?:№|N|#)?\s*$/i,'').trim()||`Договор №${contractId}`;const contractName=detectedName||'Договорённость';return{id:a.id||uid('agr'),contractName,client:a.client||a.clientName||'Клиент',text:a.text||a.agreement||a.agreement_text||'',owner:a.owner||'Менеджер',deadline:a.deadline||'',priority:a.priority||'medium',status:a.status||'pending',details:a.details||'',callId:a.callId||a.call_id||activeCallId||'',contractId,createdAt:a.createdAt||new Date().toISOString(),updatedAt:a.updatedAt||new Date().toISOString()}}
+function normalizeAgreement(a={},i=0){let contractId=String(a.contractId??a.contract_id??'').trim();let detectedName=String(a.contractName??a.contract_name??'').trim();if(!contractId&&detectedName){const m=detectedName.match(/(?:договор|сделка)\s*(?:№|N|#)?\s*(\d[\d-]*)/i);if(m)contractId=m[1]}if(contractId&&!/^\d[\d-]*$/.test(contractId))contractId='';if(contractId)detectedName=detectedName.replace(/^договор\s*(?:№|N|#)?\s*$/i,'').trim()||`Договор №${contractId}`;const contractName=detectedName||'Договорённость';return{id:a.id||uid('agr'),contractName,client:a.client||a.clientName||'Клиент',text:a.text||a.agreement||a.agreement_text||'',owner:a.owner||'Менеджер',deadline:normalizeDeadlineValue(a.deadline||a.deadline_date||a.date||''),priority:a.priority||'medium',status:a.status||'pending',details:a.details||'',callId:a.callId||a.call_id||activeCallId||'',contractId,createdAt:a.createdAt||new Date().toISOString(),updatedAt:a.updatedAt||new Date().toISOString()}}
 function saveData(data, sync=true){write(STORAGE_KEY,data);renderAgreements();if(sync)data.forEach(x=>apiSync(x))}
 async function api(path,opts={}){if(!API_BASE)throw new Error('API недоступен');const r=await fetch(API_BASE+path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});if(!r.ok)throw new Error(`${r.status} ${await r.text()}`);return r.status===204?null:r.json()}
 async function apiSync(item){try{await api('/protocol/agreement',{method:'POST',body:JSON.stringify(item)})}catch(e){log('API sync: '+e.message)}}
-function extractContractRef(text=''){const m=String(text).match(/(?:договор(?:а|у|ом)?|сделк(?:а|и|у|ой))\s*(?:№|N|#)?\s*([A-Za-zА-Яа-я0-9][\w-]*)/i);return m?String(m[1]):''}
+function extractContractRef(text=''){const s=String(text||'');if(/\bдоговор(?:а|у|ом)?\s+без\s+номера\b/i.test(s)||/\bбез\s+номера\b/i.test(s))return '';const m=s.match(/(?:договор(?:а|у|ом)?|сделк(?:а|и|у|ой))\s*(?:№|N|#)?\s*([0-9][\w-]*)/i);return m?String(m[1]):''}
 function protocolToAgreements(data){
   const result=[];
   const contracts=Array.isArray(data.contracts)?data.contracts:[];
   contracts.forEach(c=>{
     const rawName=c.contract_name||c.contractName||'';
-    const rawId=String(c.contract_id||c.contractId||extractContractRef(rawName)).trim();
+    const rawIdValue=String(c.contract_id||c.contractId||extractContractRef(rawName)).trim();const rawId=/^\d[\d-]*$/.test(rawIdValue)?rawIdValue:'';
     const contractName=rawName||'Договорённость';
     const agreements=Array.isArray(c.agreements)?c.agreements:[];
     const tasks=Array.isArray(c.tasks)?c.tasks:[];
@@ -49,13 +49,13 @@ function protocolToAgreements(data){
       const task=tasks[i]||{};
       const text=typeof a==='string'?a:a.text||'';
       const rawName=task.contract_name||task.contractName||a.contract_name||a.contractName||'';
-      const rawId=String(task.contract_id||task.contractId||a.contract_id||a.contractId||extractContractRef(rawName)||extractContractRef(text)).trim();
+      const rawIdValue=String(task.contract_id||task.contractId||a.contract_id||a.contractId||extractContractRef(rawName)||extractContractRef(text)).trim();const rawId=/^\d[\d-]*$/.test(rawIdValue)?rawIdValue:'';
       result.push(normalizeAgreement({contractName:rawName||'Договорённость',contractId:rawId,text,owner:task.owner||a.owner,deadline:task.deadline||a.deadline,priority:task.priority||a.priority||'medium'},i));
     });
     if(!agreements.length){
       tasks.forEach((task,i)=>{
         const rawName=task.contract_name||task.contractName||'';
-        const rawId=String(task.contract_id||task.contractId||extractContractRef(rawName)||extractContractRef(task.task||'')).trim();
+        const rawIdValue=String(task.contract_id||task.contractId||extractContractRef(rawName)||extractContractRef(task.task||'')).trim();const rawId=/^\d[\d-]*$/.test(rawIdValue)?rawIdValue:'';
         result.push(normalizeAgreement({contractName:rawName||'Договорённость',contractId:rawId,text:task.task||'',owner:task.owner,deadline:task.deadline,priority:task.priority||'medium'},i));
       });
     }
@@ -89,19 +89,73 @@ async function switchPage(id){
   $(id).classList.add('active-page');
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.page===id));
   if(id==='agreementsPage'){
+    // При входе в общий список показываем все записи, а не старые фильтры/поиск.
+    if($('searchInput')) $('searchInput').value='';
+    if($('statusFilter')) $('statusFilter').value='all';
+    if($('priorityFilter')) $('priorityFilter').value='all';
     renderAgreements();
     await loadAgreementsFromApi();
   }
 }
+function normalizeDeadlineValue(value){
+  if(!value)return '';
+  const s=String(value).trim();
+  const iso=s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(iso)return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const ru=s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if(ru)return `${ru[3]}-${ru[2].padStart(2,'0')}-${ru[1].padStart(2,'0')}`;
+  return '';
+}
+function formatDate(value){
+  if(!value)return '';
+  const d=new Date(String(value).includes('T')?value:String(value)+'T00:00:00');
+  if(Number.isNaN(d.getTime()))return String(value);
+  return d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric'});
+}
 function isOverdue(a){return a.status==='pending'&&a.deadline&&new Date(a.deadline+'T23:59:59')<new Date()}
-function renderAgreements(){const all=getData();els.count.textContent=all.length;const q=($('searchInput')?.value||'').toLowerCase(),sf=$('statusFilter')?.value||'all',pf=$('priorityFilter')?.value||'all';const filtered=all.filter(a=>(sf==='all'||a.status===sf)&&(pf==='all'||a.priority===pf)&&(!q||[a.contractName,a.contractId,a.client,a.text,a.owner,a.details].join(' ').toLowerCase().includes(q)));$('totalStat').textContent=all.length;$('pendingStat').textContent=all.filter(a=>a.status==='pending').length;$('doneStat').textContent=all.filter(a=>a.status==='done').length;$('overdueStat').textContent=all.filter(isOverdue).length;const overdue=all.filter(isOverdue);const ns=$('notificationStrip');if(overdue.length){ns.hidden=false;ns.innerHTML=`⚠ <b>${overdue.length}</b> ${overdue.length===1?'договорённость требует':'договорённостей требуют'} внимания: есть просроченные сроки.`}else ns.hidden=true;els.list.innerHTML=filtered.map(a=>`<article class="agreement-card ${isOverdue(a)?'overdue':''}"><div class="agreement-main"><h3>${esc(a.contractName||'Договорённость')}</h3><div class="client">Номер договора: <b>${esc(a.contractId||'—')}</b> · ${esc(a.client||'Клиент не указан')} · ${esc(a.owner)}</div><div class="agreement-text">${esc(a.text)}</div><div class="meta"><span class="pill ${a.priority}">${labels[a.priority]}</span><span class="pill ${a.status}">${labels[a.status]}</span>${a.deadline?`<span class="pill ${isOverdue(a)?'high':''}">Срок: ${esc(formatDate(a.deadline))}</span>`:''}${a.callId?`<span class="pill">Звонок: ${esc(a.callId.slice(-8))}</span>`:''}</div>${a.details?`<p class="client details">${esc(a.details)}</p>`:''}</div><div class="agreement-actions"><button class="icon-btn" onclick="editAgreement('${a.id}')">Изменить</button>${a.status==='pending'?`<button class="icon-btn" onclick="completeAgreement('${a.id}')">✓ Выполнить</button>`:''}<button class="icon-btn delete" onclick="deleteAgreement('${a.id}')">Удалить</button></div></article>`).join('');els.empty.hidden=filtered.length!==0;if(!filtered.length&&all.length)els.empty.hidden=true}
+function renderAgreements(){
+  // Старые записи из localStorage могли иметь неполную структуру. Нормализуем их
+  // перед отрисовкой, чтобы счётчик и карточки использовали один и тот же формат.
+  const raw=getData();
+  const all=raw.map((a,i)=>normalizeAgreement(a,i));
+  if(JSON.stringify(raw)!==JSON.stringify(all)) write(STORAGE_KEY,all);
+  els.count.textContent=all.length;
+  const q=($('searchInput')?.value||'').trim().toLowerCase();
+  const sf=$('statusFilter')?.value||'all';
+  const pf=$('priorityFilter')?.value||'all';
+  let filtered=all.filter(a=>(sf==='all'||a.status===sf)&&(pf==='all'||a.priority===pf)&&(!q||[a.contractName,a.contractId,a.client,a.text,a.owner,a.details].join(' ').toLowerCase().includes(q)));
+  $('totalStat').textContent=all.length;
+  $('pendingStat').textContent=all.filter(a=>a.status==='pending').length;
+  $('doneStat').textContent=all.filter(a=>a.status==='done').length;
+  $('overdueStat').textContent=all.filter(isOverdue).length;
+  const overdue=all.filter(isOverdue);
+  const ns=$('notificationStrip');
+  if(overdue.length){ns.hidden=false;ns.innerHTML=`⚠ <b>${overdue.length}</b> ${overdue.length===1?'договорённость требует':'договорённостей требуют'} внимания: есть просроченные сроки.`}else ns.hidden=true;
+  // Никогда не оставляем пользователя с пустым экраном при наличии данных.
+  // Если фильтр случайно сохранился/стал некорректным, возвращаем полный список.
+  if(!filtered.length && all.length && !q){
+    filtered=all;
+    if($('statusFilter')) $('statusFilter').value='all';
+    if($('priorityFilter')) $('priorityFilter').value='all';
+  }
+  els.list.innerHTML=filtered.map(a=>`<article class="agreement-card ${isOverdue(a)?'overdue':''}"><div class="agreement-main"><h3>${esc(a.contractName||'Договорённость')}</h3><div class="client">Номер договора: <b>${esc(a.contractId||'—')}</b> · ${esc(a.client||'Клиент не указан')} · ${esc(a.owner||'Менеджер')}</div><div class="agreement-text">${esc(a.text||'')}</div><div class="meta"><span class="pill ${a.priority}">${labels[a.priority]||'Средний'}</span><span class="pill ${a.status}">${labels[a.status]||'В работе'}</span>${a.deadline?`<span class="pill ${isOverdue(a)?'high':''}">Срок: ${esc(formatDate(a.deadline))}</span>`:''}${a.callId?`<span class="pill">Звонок: ${esc(String(a.callId).slice(-8))}</span>`:''}</div>${a.details?`<p class="client details">${esc(a.details)}</p>`:''}</div><div class="agreement-actions"><button class="icon-btn" onclick="editAgreement('${a.id}')">Изменить</button>${a.status==='pending'?`<button class="icon-btn" onclick="completeAgreement('${a.id}')">✓ Выполнить</button>`:''}<button class="icon-btn delete" onclick="deleteAgreement('${a.id}')">Удалить</button></div></article>`).join('');
+  els.empty.hidden=filtered.length!==0;
+  if(!filtered.length && q){
+    els.empty.hidden=false;
+    els.empty.querySelector('h2').textContent='Поиск ничего не нашёл';
+    els.empty.querySelector('p').textContent='Очистите строку поиска, чтобы увидеть все договорённости.';
+  }else if(filtered.length){
+    els.empty.querySelector('h2').textContent='Договорённостей пока нет';
+    els.empty.querySelector('p').textContent='Запустите демо-звонок или добавьте первую вручную.';
+  }
+}
 
-function openModal(item=null){$('agreementForm').reset();$('agreementForm').querySelector('button[type=submit]').textContent='Сохранить';$('editId').value=item?.id||'';$('modalTitle').textContent=item?'Изменить договорённость':'Новая договорённость';$('contractId').value=item?.contractId||extractContractRef(item?.contractName||'');$('contractName').value=item?.contractName||'';$('clientName').value=item?.client||'';$('agreementText').value=item?.text||'';$('owner').value=item?.owner||'Менеджер';$('deadline').value=item?.deadline||'';$('priority').value=item?.priority||'medium';$('agreementStatus').value=item?.status||'pending';$('details').value=item?.details||'';els.modal.hidden=false}
+function openModal(item=null){$('agreementForm').reset();$('agreementForm').querySelector('button[type=submit]').textContent='Сохранить';$('editId').value=item?.id||'';$('modalTitle').textContent=item?'Изменить договорённость':'Новая договорённость';$('contractId').value=item?.contractId||extractContractRef(item?.contractName||'');$('contractName').value=item?.contractName||'';$('clientName').value=item?.client||'';$('agreementText').value=item?.text||'';$('owner').value=item?.owner||'Менеджер';$('deadline').value=normalizeDeadlineValue(item?.deadline||'');$('priority').value=item?.priority||'medium';$('agreementStatus').value=item?.status||'pending';$('details').value=item?.details||'';els.modal.hidden=false}
 function closeModal(){$('modal').hidden=true}
 window.editAgreement=id=>{const a=getData().find(x=>x.id===id);if(a)openModal(a)};
 window.completeAgreement=async id=>{const all=getData(),a=all.find(x=>x.id===id);if(!a)return;a.status='done';a.updatedAt=new Date().toISOString();write(STORAGE_KEY,all);renderAgreements();await apiSync(a);log(`Договорённость выполнена: ${a.text}`);toast('Договорённость отмечена как выполненная')};
 window.deleteAgreement=async id=>{const a=getData().find(x=>x.id===id);if(!a||!confirm(`Удалить договорённость «${a.text}»?`))return;write(STORAGE_KEY,getData().filter(x=>x.id!==id));renderAgreements();try{await api(`/protocol/agreement/${encodeURIComponent(id)}`,{method:'DELETE'})}catch{}log('Договорённость удалена')};
-$('agreementForm').addEventListener('submit',async e=>{e.preventDefault();const data=getData(),id=$('editId').value,contractId=$('contractId').value.trim(),contractName=$('contractName').value.trim()||(contractId?`Договор №${contractId}`:'Договорённость');const fromDetected=!!pendingDetectedEdit;const item=normalizeAgreement({...(fromDetected?pendingDetectedEdit:{}),id:id||uid('agr'),contractName,contractId,client:$('clientName').value,text:$('agreementText').value,owner:$('owner').value,deadline:$('deadline').value,priority:$('priority').value,status:$('agreementStatus').value,details:$('details').value,callId:activeCallId});closeModal();if(fromDetected){pendingDetectedEdit=null;currentDetected=[item];$('liveAgreementTitle').textContent='Обнаружена договорённость';$('liveAgreementText').textContent=`${item.contractName}: ${item.text}`;$('liveAgreementBox').hidden=false;log('AI: изменённая договорённость сохранена в окне подтверждения. Нажмите «Подтвердить», чтобы добавить её в список.');toast('Изменения сохранены. Теперь нажмите «Подтвердить»')}else{const next=id?data.map(x=>x.id===id?item:x):[item,...data];write(STORAGE_KEY,next);renderAgreements();try{await apiSync(item);await loadAgreementsFromApi()}catch(e){log('Синхронизация: '+e.message)}if(!id&&settings.autoCreateTasks)await createCRMTask(item);if(!id&&settings.autoCreateCalendar&&/встреч|созвон|звонок/i.test(item.text))await createCalendarEvent(item);log(id?'Договорённость изменена':'Новая договорённость сохранена');toast(id?'Договорённость изменена':'Договорённость сохранена')}});
+$('agreementForm').addEventListener('submit',async e=>{e.preventDefault();const data=getData(),id=$('editId').value,contractId=$('contractId').value.trim(),contractName=$('contractName').value.trim()||(contractId?`Договор №${contractId}`:'Договорённость');const fromDetected=!!pendingDetectedEdit;const item=normalizeAgreement({...(fromDetected?pendingDetectedEdit:{}),id:id||uid('agr'),contractName,contractId,client:$('clientName').value,text:$('agreementText').value,owner:$('owner').value,deadline:$('deadline').value,priority:$('priority').value,status:$('agreementStatus').value,details:$('details').value,callId:activeCallId});closeModal();if(fromDetected){pendingDetectedEdit=null;currentDetected=[item,...(Array.isArray(currentDetected)?currentDetected:[])];$('liveAgreementTitle').textContent='Обнаружена договорённость';$('liveAgreementText').textContent=`${item.contractName}: ${item.text}`;$('liveAgreementBox').hidden=false;log('AI: изменённая договорённость сохранена в окне подтверждения. Нажмите «Подтвердить», чтобы добавить её в список.');toast('Изменения сохранены. Теперь нажмите «Подтвердить»')}else{const next=id?data.map(x=>x.id===id?item:x):[item,...data];write(STORAGE_KEY,next);renderAgreements();try{await apiSync(item);await loadAgreementsFromApi()}catch(e){log('Синхронизация: '+e.message)}if(!id&&settings.autoCreateTasks)await createCRMTask(item);if(!id&&settings.autoCreateCalendar&&/встреч|созвон|звонок/i.test(item.text))await createCalendarEvent(item);log(id?'Договорённость изменена':'Новая договорённость сохранена');toast(id?'Договорённость изменена':'Договорённость сохранена')}});
 
 function renderProtocol(data){lastProtocol=data;const contracts=data.contracts?.length?data.contracts:[{contract_name:'Общий разговор',agreements:data.agreements||[],tasks:data.tasks||[]}];els.protocol.classList.remove('empty-state');els.protocol.innerHTML=contracts.map((c,i)=>`<div class="contract-preview"><h3>${esc(c.contract_name||`Договор №${i+1}`)}</h3>${(c.agreements||[]).map(a=>`<p>• ${esc(typeof a==='string'?a:a.text||'')}</p>`).join('')}${(c.tasks||[]).map(t=>`<span class="task-chip">${esc(t.owner||'—')}: ${esc(t.task||'—')}${t.deadline?' · '+esc(t.deadline):''}</span>`).join('')}</div>`).join('');els.found.textContent=`${protocolToAgreements(data).length} договорённостей`;const summary=data.summary||buildSummary(data);$('summary').textContent=summary}
 function buildSummary(data){const n=protocolToAgreements(data).length,c=data.contracts?.length||0;return `Обсуждены ${c||'несколько'} ${c===1?'договор':'договоров'}. Зафиксировано ${n} договорённост${n===1?'ь':'и'}. По результатам разговора сформированы задачи и сроки.`}

@@ -356,15 +356,17 @@ def _enrich_deadlines(data, transcript):
         local=_extract_date_candidates(ev+' '+txt,ref)
         if local:
             return local[0]['value']
-        # Если у LLM уже есть дата, нормализуем её, но не даём ей
-        # перекрыть явно найденную дату в evidence.
-        current=_normalize_deadline(item.get('deadline'),ref)
-        if current:return current
+        # Сначала доверяем датам, которые реально есть в транскрипте.
+        # Qwen иногда ошибочно нормализует «до пятницы» в произвольную дату.
         pool=local_candidates or candidates
-        if len(pool)==1:return pool[0]['value']
         pos=evidence_pos(item)
         if pos>=0 and pool:
             return min(pool,key=lambda x:abs(x['start']-pos))['value']
+        if len(pool)==1:return pool[0]['value']
+        # Только если в исходной речи нет подходящей даты, используем
+        # уже нормализованный deadline от LLM.
+        current=_normalize_deadline(item.get('deadline'),ref)
+        if current:return current
         return ''
     for key in ('tasks','agreements'):
         for item in data.get(key) or []:
@@ -395,19 +397,26 @@ def _apply_contract_ids(data, transcript):
     for c in data.get('contracts') or []:
         if not isinstance(c,dict): continue
         cid=str(c.get('contract_id') or '').strip()
+        if cid and not re.fullmatch(r'\d[\d-]*', cid): cid=''
         if not cid:
             for item in list(c.get('agreements') or [])+list(c.get('tasks') or []):
                 cid=item_id(item)
                 if cid: break
         if not cid: cid=_contract_id_from_text(c.get('contract_name',''))
+        if cid and not re.fullmatch(r'\d[\d-]*', cid): cid=''
         c['contract_id']=cid
         c['contract_name']=f'Договор №{cid}' if cid else 'Договор без номера'
     # Top-level items can also carry the contract number.
     for key in ('agreements','tasks'):
         for item in data.get(key) or []:
-            if isinstance(item,dict) and not item.get('contract_id'):
-                cid=item_id(item)
-                if cid: item['contract_id']=cid; item['contract_name']=f'Договор №{cid}'
+            if isinstance(item,dict):
+                cid=str(item.get('contract_id') or '').strip()
+                if cid and not re.fullmatch(r'\d[\d-]*', cid): cid=''
+                if not cid: cid=item_id(item)
+                if cid and re.fullmatch(r'\d[\d-]*', cid):
+                    item['contract_id']=cid; item['contract_name']=f'Договор №{cid}'
+                elif not item.get('contract_id'):
+                    item['contract_name']='Договор без номера'
     return data
 
 def _business_retry_prompt(transcript_text: str) -> str:
